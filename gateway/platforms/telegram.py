@@ -8,9 +8,12 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import logging
 import os
 import re
 from typing import Dict, List, Optional, Any
+
+logger = logging.getLogger(__name__)
 
 try:
     from telegram import Update, Bot, Message
@@ -295,6 +298,43 @@ class TelegramAdapter(BasePlatformAdapter):
             print(f"[{self.name}] Failed to send animation, falling back to photo: {e}")
             # Fallback: try as a regular photo
             return await self.send_image(chat_id, animation_url, caption, reply_to)
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+    ) -> SendResult:
+        """Edit an existing Telegram message."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            await self._bot.edit_message_text(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                text=content,
+                parse_mode=None,
+            )
+            return SendResult(success=True, message_id=message_id)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def pin_message(self, chat_id: str, message_id: str) -> bool:
+        """Pin a message in a Telegram chat."""
+        if not self._bot:
+            return False
+
+        try:
+            await self._bot.pin_chat_message(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                disable_notification=True,
+            )
+            return True
+        except Exception as e:
+            logger.warning("Failed to pin message in %s: %s", chat_id, e)
+            return False
 
     async def send_typing(self, chat_id: str) -> None:
         """Send typing indicator."""

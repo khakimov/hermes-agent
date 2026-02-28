@@ -162,6 +162,10 @@ class GatewayRunner:
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str}
         self._pending_approvals: Dict[str, Dict[str, str]] = {}
+
+        # Pinned status messages per session
+        # Key: session_key, Value: {"chat_id": str, "message_id": str}
+        self._pinned_status_msgs: Dict[str, Dict[str, str]] = {}
         
         # Initialize session database for session_search tool support
         self._session_db = None
@@ -901,7 +905,22 @@ class GatewayRunner:
             
             # Update session
             self.session_store.update_session(session_entry.session_key)
-            
+
+            # Update pinned status message (Telegram only, best-effort)
+            try:
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    await self._update_status_pin(
+                        session_key=session_key,
+                        session_entry=session_entry,
+                        source=source,
+                        adapter=adapter,
+                        api_calls=agent_result.get("api_calls", 0),
+                        history_len=len(agent_messages),
+                    )
+            except Exception as e:
+                logger.debug("Status pin update failed: %s", e)
+
             return response
             
         except Exception as e:
@@ -960,7 +979,10 @@ class GatewayRunner:
         
         # Reset the session
         new_entry = self.session_store.reset_session(session_key)
-        
+
+        # Clear pinned status message tracking so next session gets a fresh pin
+        self._pinned_status_msgs.pop(session_key, None)
+
         # Emit session:reset hook
         await self.hooks.emit("session:reset", {
             "platform": source.platform.value if source.platform else "",
@@ -1000,6 +1022,64 @@ class GatewayRunner:
         
         return "\n".join(lines)
     
+    async def _update_status_pin(
+        self,
+        session_key: str,
+        session_entry,
+        source,
+        adapter,
+        api_calls: int = 0,
+        history_len: int = 0,
+    ) -> None:
+        """Send or update a pinned status message for this session."""
+        chat_id = source.chat_id
+        model = os.getenv("HERMES_MODEL", os.getenv("LLM_MODEL", "unknown"))
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        age = datetime.now() - session_entry.created_at
+        age_parts = []
+        if age.days:
+            age_parts.append(f"{age.days}d")
+        hours = age.seconds // 3600
+        if hours:
+            age_parts.append(f"{hours}h")
+        minutes = (age.seconds % 3600) // 60
+        age_parts.append(f"{minutes}m")
+        age_str = " ".join(age_parts)
+
+        content = (
+            f"📊 Session Status\n"
+            f"├ Model: {model}\n"
+            f"├ Messages: {history_len}\n"
+            f"├ API calls this turn: {api_calls}\n"
+            f"├ Session age: {age_str}\n"
+            f"├ Session: {session_entry.session_id[:12]}…\n"
+            f"└ Updated: {now}"
+        )
+
+        pin_info = self._pinned_status_msgs.get(session_key)
+
+        if pin_info:
+            # Edit the existing pinned message
+            result = await adapter.edit_message(
+                chat_id=pin_info["chat_id"],
+                message_id=pin_info["message_id"],
+                content=content,
+            )
+            if result.success:
+                return
+            # If edit failed (message deleted?), fall through to send a new one
+            logger.debug("Failed to edit pinned status msg: %s", result.error)
+
+        # Send a new status message and pin it
+        result = await adapter.send(chat_id=chat_id, content=content)
+        if result.success and result.message_id:
+            pinned = await adapter.pin_message(chat_id, result.message_id)
+            if pinned:
+                self._pinned_status_msgs[session_key] = {
+                    "chat_id": chat_id,
+                    "message_id": result.message_id,
+                }
+
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent."""
         source = event.source

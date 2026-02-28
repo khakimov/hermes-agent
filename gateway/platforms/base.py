@@ -399,10 +399,33 @@ class BasePlatformAdapter(ABC):
         """
         pass
     
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+    ) -> SendResult:
+        """
+        Edit an existing message.
+
+        Override in subclasses if the platform supports it.
+        Default returns failure (not supported).
+        """
+        return SendResult(success=False, error="edit_message not supported")
+
+    async def pin_message(self, chat_id: str, message_id: str) -> bool:
+        """
+        Pin a message in a chat.
+
+        Override in subclasses if the platform supports it.
+        Default is a no-op returning False.
+        """
+        return False
+
     async def send_typing(self, chat_id: str) -> None:
         """
         Send a typing indicator.
-        
+
         Override in subclasses if the platform supports it.
         """
         pass
