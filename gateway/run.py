@@ -903,8 +903,12 @@ class GatewayRunner:
                         session_entry.session_id, entry
                     )
             
-            # Update session
-            self.session_store.update_session(session_entry.session_key)
+            # Update session with token usage
+            self.session_store.update_session(
+                session_entry.session_key,
+                input_tokens=agent_result.get("input_tokens", 0),
+                output_tokens=agent_result.get("output_tokens", 0),
+            )
 
             # Update pinned status message (DM only, best-effort)
             try:
@@ -1866,11 +1870,21 @@ class GatewayRunner:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
             
+            # Extract cumulative token usage from the agent's context compressor
+            _agent = agent_holder[0]
+            _prompt_tokens = 0
+            _completion_tokens = 0
+            if _agent and hasattr(_agent, "context_compressor"):
+                _prompt_tokens = _agent.context_compressor.last_prompt_tokens or 0
+                _completion_tokens = _agent.context_compressor.last_completion_tokens or 0
+
             return {
                 "final_response": final_response,
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "tools": tools_holder[0] or [],
+                "input_tokens": _prompt_tokens,
+                "output_tokens": _completion_tokens,
             }
         
         # Start progress message sender if enabled
