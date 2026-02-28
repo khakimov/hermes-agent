@@ -574,24 +574,70 @@ class SessionStore:
             try:
                 messages = self._db.get_messages_as_conversation(session_id)
                 if messages:
-                    return messages
+                    return self._sanitize_tool_calls(messages)
             except Exception as e:
                 logger.debug("Could not load messages from DB: %s", e)
-        
+
         # Fall back to legacy JSONL
         transcript_path = self.get_transcript_path(session_id)
-        
+
         if not transcript_path.exists():
             return []
-        
+
         messages = []
         with open(transcript_path, "r") as f:
             for line in f:
                 line = line.strip()
                 if line:
                     messages.append(json.loads(line))
-        
-        return messages
+
+        return self._sanitize_tool_calls(messages)
+
+    @staticmethod
+    def _sanitize_tool_calls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove orphaned tool_calls that lack corresponding tool responses.
+
+        This handles the case where the process was killed mid-tool-execution:
+        the assistant message with tool_calls was saved, but the tool response
+        messages never made it to the DB.  Sending such a history to the API
+        causes a 400 error.
+        """
+        if not messages:
+            return messages
+
+        # Collect all tool_call_ids that have a tool response
+        responded_ids: set = set()
+        for msg in messages:
+            if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                responded_ids.add(msg["tool_call_id"])
+
+        # Walk messages and strip orphaned tool_calls
+        sanitized: List[Dict[str, Any]] = []
+        for msg in messages:
+            tool_calls = msg.get("tool_calls")
+            if msg.get("role") == "assistant" and tool_calls:
+                # Keep only tool_calls that have a matching response
+                valid = [tc for tc in tool_calls if tc.get("id") in responded_ids]
+                if not valid:
+                    # No tool_calls survived — keep the message only if it has content
+                    if msg.get("content"):
+                        cleaned = {k: v for k, v in msg.items() if k != "tool_calls"}
+                        sanitized.append(cleaned)
+                    else:
+                        logger.warning(
+                            "Dropping orphaned assistant tool_calls message "
+                            "(process likely killed mid-execution)"
+                        )
+                    continue
+                if len(valid) < len(tool_calls):
+                    logger.warning(
+                        "Stripped %d orphaned tool_call(s) from assistant message",
+                        len(tool_calls) - len(valid),
+                    )
+                    msg = {**msg, "tool_calls": valid}
+            sanitized.append(msg)
+
+        return sanitized
 
 
 def build_session_context(
