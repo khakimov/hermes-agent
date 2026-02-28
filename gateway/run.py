@@ -906,10 +906,10 @@ class GatewayRunner:
             # Update session
             self.session_store.update_session(session_entry.session_key)
 
-            # Update pinned status message (Telegram only, best-effort)
+            # Update pinned status message (DM only, best-effort)
             try:
                 adapter = self.adapters.get(source.platform)
-                if adapter:
+                if adapter and source.chat_type == "dm":
                     await self._update_status_pin(
                         session_key=session_key,
                         session_entry=session_entry,
@@ -1051,6 +1051,7 @@ class GatewayRunner:
             f"├ Model: {model}\n"
             f"├ Messages: {history_len}\n"
             f"├ API calls this turn: {api_calls}\n"
+            f"├ Tokens: {session_entry.total_tokens:,}\n"
             f"├ Session age: {age_str}\n"
             f"├ Session: {session_entry.session_id[:12]}…\n"
             f"└ Updated: {now}"
