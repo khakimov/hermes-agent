@@ -436,8 +436,7 @@ class AIAgent:
             try:
                 from honcho_integration.client import HonchoClientConfig, get_honcho_client
                 hcfg = HonchoClientConfig.from_global_config()
-                logger.info("Honcho config: enabled=%s, api_key=%s, env=%s, workspace=%s",
-                            hcfg.enabled, bool(hcfg.api_key), hcfg.environment, hcfg.workspace_id)
+                print(f"[Honcho] config: enabled={hcfg.enabled}, api_key={bool(hcfg.api_key)}, env={hcfg.environment}, workspace={hcfg.workspace_id}", flush=True)
                 if hcfg.enabled and hcfg.api_key:
                     from honcho_integration.session import HonchoSessionManager
                     client = get_honcho_client(hcfg)
@@ -457,17 +456,14 @@ class AIAgent:
                     # Inject session context into the honcho tool module
                     from tools.honcho_tools import set_session_context
                     set_session_context(self._honcho, self._honcho_session_key)
-                    logger.info(
-                        "Honcho active (session: %s, user: %s, workspace: %s)",
-                        self._honcho_session_key, hcfg.peer_name, hcfg.workspace_id,
-                    )
+                    print(f"[Honcho] active (session: {self._honcho_session_key}, user: {hcfg.peer_name}, workspace: {hcfg.workspace_id})", flush=True)
                 else:
                     if not hcfg.enabled:
-                        logger.info("Honcho disabled in global config (enabled=%s)", hcfg.enabled)
+                        print(f"[Honcho] disabled in config (enabled={hcfg.enabled})", flush=True)
                     elif not hcfg.api_key:
-                        logger.info("Honcho enabled but no API key configured")
+                        print("[Honcho] enabled but no API key configured", flush=True)
             except Exception as e:
-                logger.info("Honcho init failed (non-fatal): %s", e)
+                print(f"[Honcho] init failed: {e}", flush=True)
                 self._honcho = None
 
         # Skills config: nudge interval for skill creation reminders
