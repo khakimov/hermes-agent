@@ -336,6 +336,21 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("Failed to pin message in %s: %s", chat_id, e)
             return False
 
+    async def unpin_message(self, chat_id: str, message_id: str) -> bool:
+        """Unpin a message in a Telegram chat."""
+        if not self._bot:
+            return False
+
+        try:
+            await self._bot.unpin_chat_message(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+            )
+            return True
+        except Exception as e:
+            logger.debug("Failed to unpin message in %s: %s", chat_id, e)
+            return False
+
     async def find_pinned_status_message(self, chat_id: str) -> Optional[str]:
         """Find an existing bot-sent status pin in a chat.
 

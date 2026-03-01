@@ -988,8 +988,25 @@ class GatewayRunner:
         # Reset the session
         new_entry = self.session_store.reset_session(session_key)
 
-        # Clear pinned status message tracking so next session gets a fresh pin
-        self._pinned_status_msgs.pop(session_key, None)
+        # Unpin and clear pinned status message so next session gets a fresh pin
+        old_pin = self._pinned_status_msgs.pop(session_key, None)
+        if old_pin:
+            try:
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    await adapter.unpin_message(old_pin["chat_id"], old_pin["message_id"])
+            except Exception:
+                pass
+        else:
+            # No cached pin — try to find and unpin any existing one
+            try:
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    existing_id = await adapter.find_pinned_status_message(source.chat_id)
+                    if existing_id:
+                        await adapter.unpin_message(source.chat_id, existing_id)
+            except Exception:
+                pass
 
         # Emit session:reset hook
         await self.hooks.emit("session:reset", {

@@ -422,6 +422,15 @@ class BasePlatformAdapter(ABC):
         """
         return False
 
+    async def unpin_message(self, chat_id: str, message_id: str) -> bool:
+        """
+        Unpin a message in a chat.
+
+        Override in subclasses if the platform supports it.
+        Default is a no-op returning False.
+        """
+        return False
+
     async def find_pinned_status_message(self, chat_id: str) -> Optional[str]:
         """
         Find an existing bot-sent status pin in a chat.
