@@ -125,6 +125,28 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 logger = logging.getLogger(__name__)
 
 
+def _resolve_runtime_agent_kwargs() -> dict:
+    """Resolve provider credentials for gateway-created AIAgent instances."""
+    from hermes_cli.runtime_provider import (
+        resolve_runtime_provider,
+        format_runtime_provider_error,
+    )
+
+    try:
+        runtime = resolve_runtime_provider(
+            requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+        )
+    except Exception as exc:
+        raise RuntimeError(format_runtime_provider_error(exc)) from exc
+
+    return {
+        "api_key": runtime.get("api_key"),
+        "base_url": runtime.get("base_url"),
+        "provider": runtime.get("provider"),
+        "api_mode": runtime.get("api_mode"),
+    }
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -196,17 +218,12 @@ class GatewayRunner:
                 return
 
             from run_agent import AIAgent
-            _flush_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
-            _flush_base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-            _flush_model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL", "anthropic/claude-opus-4.6")
-
-            if not _flush_api_key:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            if not runtime_kwargs.get("api_key"):
                 return
 
             tmp_agent = AIAgent(
-                model=_flush_model,
-                api_key=_flush_api_key,
-                base_url=_flush_base_url,
+                **runtime_kwargs,
                 max_iterations=8,
                 quiet_mode=True,
                 enabled_toolsets=["memory", "skills"],
@@ -613,6 +630,19 @@ class GatewayRunner:
         
         # Check for commands
         command = event.get_command()
+        
+        # Emit command:* hook for any recognized slash command
+        _known_commands = {"new", "reset", "help", "status", "stop", "model",
+                          "personality", "retry", "undo", "sethome", "set-home",
+                          "compress", "usage"}
+        if command and command in _known_commands:
+            await self.hooks.emit(f"command:{command}", {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "command": command,
+                "args": event.get_command_args().strip(),
+            })
+        
         if command in ["new", "reset"]:
             return await self._handle_reset_command(event)
         
@@ -639,6 +669,12 @@ class GatewayRunner:
         
         if command in ["sethome", "set-home"]:
             return await self._handle_set_home_command(event)
+
+        if command == "compress":
+            return await self._handle_compress_command(event)
+
+        if command == "usage":
+            return await self._handle_usage_command(event)
         
         # Skill slash commands: /skill-name loads the skill and sends to agent
         if command:
@@ -682,6 +718,19 @@ class GatewayRunner:
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        
+        # Emit session:start for new or auto-reset sessions
+        _is_new_session = (
+            session_entry.created_at == session_entry.updated_at
+            or getattr(session_entry, "was_auto_reset", False)
+        )
+        if _is_new_session:
+            await self.hooks.emit("session:start", {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "session_id": session_entry.session_id,
+                "session_key": session_key,
+            })
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
@@ -959,15 +1008,10 @@ class GatewayRunner:
                 if old_history:
                     from run_agent import AIAgent
                     loop = asyncio.get_event_loop()
-                    # Resolve credentials so the flush agent can reach the LLM
-                    _flush_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
-                    _flush_base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-                    _flush_model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL", "anthropic/claude-opus-4.6")
+                    _flush_kwargs = _resolve_runtime_agent_kwargs()
                     def _do_flush():
                         tmp_agent = AIAgent(
-                            model=_flush_model,
-                            api_key=_flush_api_key,
-                            base_url=_flush_base_url,
+                            **_flush_kwargs,
                             max_iterations=5,
                             quiet_mode=True,
                             enabled_toolsets=["memory"],
@@ -1144,6 +1188,8 @@ class GatewayRunner:
             "`/retry` — Retry your last message",
             "`/undo` — Remove the last exchange",
             "`/sethome` — Set this chat as the home channel",
+            "`/compress` — Compress conversation context",
+            "`/usage` — Show token usage for this session",
             "`/help` — Show this message",
         ]
         try:
@@ -1348,6 +1394,95 @@ class GatewayRunner:
             f"Cron jobs and cross-platform messages will be delivered here."
         )
     
+    async def _handle_compress_command(self, event: MessageEvent) -> str:
+        """Handle /compress command -- manually compress conversation context."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+
+        if not history or len(history) < 4:
+            return "Not enough conversation to compress (need at least 4 messages)."
+
+        try:
+            from run_agent import AIAgent
+            from agent.model_metadata import estimate_messages_tokens_rough
+
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            if not runtime_kwargs.get("api_key"):
+                return "No provider configured -- cannot compress."
+
+            msgs = [
+                {"role": m.get("role"), "content": m.get("content")}
+                for m in history
+                if m.get("role") in ("user", "assistant") and m.get("content")
+            ]
+            original_count = len(msgs)
+            approx_tokens = estimate_messages_tokens_rough(msgs)
+
+            tmp_agent = AIAgent(
+                **runtime_kwargs,
+                max_iterations=4,
+                quiet_mode=True,
+                enabled_toolsets=["memory"],
+                session_id=session_entry.session_id,
+            )
+
+            loop = asyncio.get_event_loop()
+            compressed, _ = await loop.run_in_executor(
+                None,
+                lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens),
+            )
+
+            session_entry.conversation_history = compressed
+            new_count = len(compressed)
+            new_tokens = estimate_messages_tokens_rough(compressed)
+
+            return (
+                f"🗜️ Compressed: {original_count} → {new_count} messages\n"
+                f"~{approx_tokens:,} → ~{new_tokens:,} tokens"
+            )
+        except Exception as e:
+            logger.warning("Manual compress failed: %s", e)
+            return f"Compression failed: {e}"
+
+    async def _handle_usage_command(self, event: MessageEvent) -> str:
+        """Handle /usage command -- show token usage for the session's last agent run."""
+        source = event.source
+        session_key = f"agent:main:{source.platform.value}:" + \
+                      (f"dm" if source.chat_type == "dm" else f"{source.chat_type}:{source.chat_id}")
+
+        agent = self._running_agents.get(session_key)
+        if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
+            lines = [
+                "📊 **Session Token Usage**",
+                f"Prompt (input): {agent.session_prompt_tokens:,}",
+                f"Completion (output): {agent.session_completion_tokens:,}",
+                f"Total: {agent.session_total_tokens:,}",
+                f"API calls: {agent.session_api_calls}",
+            ]
+            ctx = agent.context_compressor
+            if ctx.last_prompt_tokens:
+                pct = ctx.last_prompt_tokens / ctx.context_length * 100 if ctx.context_length else 0
+                lines.append(f"Context: {ctx.last_prompt_tokens:,} / {ctx.context_length:,} ({pct:.0f}%)")
+            if ctx.compression_count:
+                lines.append(f"Compressions: {ctx.compression_count}")
+            return "\n".join(lines)
+
+        # No running agent -- check session history for a rough count
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+        if history:
+            from agent.model_metadata import estimate_messages_tokens_rough
+            msgs = [m for m in history if m.get("role") in ("user", "assistant") and m.get("content")]
+            approx = estimate_messages_tokens_rough(msgs)
+            return (
+                f"📊 **Session Info**\n"
+                f"Messages: {len(msgs)}\n"
+                f"Estimated context: ~{approx:,} tokens\n"
+                f"_(Detailed usage available during active conversations)_"
+            )
+        return "No usage data available for this session."
+
     def _set_session_env(self, context: SessionContext) -> None:
         """Set environment variables for the current session."""
         os.environ["HERMES_SESSION_PLATFORM"] = context.source.platform.value
@@ -1736,6 +1871,25 @@ class GatewayRunner:
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         
+        # Bridge sync step_callback → async hooks.emit for agent:step events
+        _loop_for_step = asyncio.get_event_loop()
+        _hooks_ref = self.hooks
+
+        def _step_callback_sync(iteration: int, tool_names: list) -> None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _hooks_ref.emit("agent:step", {
+                        "platform": source.platform.value if source.platform else "",
+                        "user_id": source.user_id,
+                        "session_id": session_id,
+                        "iteration": iteration,
+                        "tool_names": tool_names,
+                    }),
+                    _loop_for_step,
+                )
+            except Exception as _e:
+                logger.debug("agent:step hook error: %s", _e)
+
         def run_sync():
             # Pass session_key to process registry via env var so background
             # processes can be mapped back to this gateway session
@@ -1752,7 +1906,7 @@ class GatewayRunner:
             combined_ephemeral = context_prompt or ""
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
-            
+
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).
             try:
@@ -1762,9 +1916,6 @@ class GatewayRunner:
             except Exception:
                 pass
 
-            # Custom endpoint (OPENAI_*) takes precedence, matching CLI behavior
-            api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
-            base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
             model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
 
             try:
@@ -1778,24 +1929,22 @@ class GatewayRunner:
                         model = _model_cfg
                     elif isinstance(_model_cfg, dict):
                         model = _model_cfg.get("default", model)
-                        base_url = _model_cfg.get("base_url", base_url)
-                    # Check if provider is nous — resolve OAuth credentials
-                    provider = _model_cfg.get("provider", "") if isinstance(_model_cfg, dict) else ""
-                    if provider == "nous":
-                        try:
-                            from hermes_cli.auth import resolve_nous_runtime_credentials
-                            creds = resolve_nous_runtime_credentials(min_key_ttl_seconds=5 * 60)
-                            api_key = creds.get("api_key", api_key)
-                            base_url = creds.get("base_url", base_url)
-                        except Exception as nous_err:
-                            logger.warning("Nous Portal credential resolution failed: %s", nous_err)
             except Exception:
                 pass
 
+            try:
+                runtime_kwargs = _resolve_runtime_agent_kwargs()
+            except Exception as exc:
+                return {
+                    "final_response": f"⚠️ Provider authentication failed: {exc}",
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                }
+
             agent = AIAgent(
                 model=model,
-                api_key=api_key,
-                base_url=base_url,
+                **runtime_kwargs,
                 max_iterations=max_iterations,
                 quiet_mode=True,
                 verbose_logging=False,
@@ -1805,6 +1954,7 @@ class GatewayRunner:
                 reasoning_config=self._reasoning_config,
                 session_id=session_id,
                 tool_progress_callback=progress_callback if tool_progress_enabled else None,
+                step_callback=_step_callback_sync if _hooks_ref.loaded_hooks else None,
                 platform=platform_key,
                 honcho_session_key=session_key,
                 session_db=self._session_db,
@@ -1857,6 +2007,19 @@ class GatewayRunner:
                             content = f"[Delivered from {mirror_src}] {content}"
                         agent_history.append({"role": role, "content": content})
             
+            # Collect MEDIA paths already in history so we can exclude them
+            # from the current turn's extraction. This is compression-safe:
+            # even if the message list shrinks, we know which paths are old.
+            _history_media_paths: set = set()
+            for _hm in agent_history:
+                if _hm.get("role") in ("tool", "function"):
+                    _hc = _hm.get("content", "")
+                    if "MEDIA:" in _hc:
+                        for _match in re.finditer(r'MEDIA:(\S+)', _hc):
+                            _p = _match.group(1).strip().rstrip('",}')
+                            if _p:
+                                _history_media_paths.add(_p)
+            
             result = agent.run_conversation(message, conversation_history=agent_history)
             result_holder[0] = result
             
@@ -1877,22 +2040,25 @@ class GatewayRunner:
             # doesn't include them.  We collect unique tags from tool results and
             # append any that aren't already present in the final response, so the
             # adapter's extract_media() can find and deliver the files exactly once.
+            #
+            # Uses path-based deduplication against _history_media_paths (collected
+            # before run_conversation) instead of index slicing. This is safe even
+            # when context compression shrinks the message list. (Fixes #160)
             if "MEDIA:" not in final_response:
                 media_tags = []
                 has_voice_directive = False
                 for msg in result.get("messages", []):
-                    if msg.get("role") == "tool" or msg.get("role") == "function":
+                    if msg.get("role") in ("tool", "function"):
                         content = msg.get("content", "")
                         if "MEDIA:" in content:
                             for match in re.finditer(r'MEDIA:(\S+)', content):
                                 path = match.group(1).strip().rstrip('",}')
-                                if path:
+                                if path and path not in _history_media_paths:
                                     media_tags.append(f"MEDIA:{path}")
                             if "[[audio_as_voice]]" in content:
                                 has_voice_directive = True
                 
                 if media_tags:
-                    # Deduplicate while preserving order
                     seen = set()
                     unique_tags = []
                     for tag in media_tags:
@@ -2087,9 +2253,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
     )
-    file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    from agent.redact import RedactingFormatter
+    file_handler.setFormatter(RedactingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
     logging.getLogger().addHandler(file_handler)
     logging.getLogger().setLevel(logging.INFO)
+
+    # Separate errors-only log for easy debugging
+    error_handler = RotatingFileHandler(
+        log_dir / 'errors.log',
+        maxBytes=2 * 1024 * 1024,
+        backupCount=2,
+    )
+    error_handler.setLevel(logging.WARNING)
+    error_handler.setFormatter(RedactingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    logging.getLogger().addHandler(error_handler)
 
     runner = GatewayRunner(config)
     

@@ -803,7 +803,7 @@ class HermesCLI:
         Args:
             model: Model to use (default: from env or claude-sonnet)
             toolsets: List of toolsets to enable (default: all)
-            provider: Inference provider ("auto", "openrouter", "nous")
+            provider: Inference provider ("auto", "openrouter", "nous", "openai-codex")
             api_key: API key (default: from environment)
             base_url: API base URL (default: OpenRouter)
             max_turns: Maximum tool-calling iterations (default: 60)
@@ -821,30 +821,30 @@ class HermesCLI:
         # Configuration - priority: CLI args > env vars > config file
         # Model can come from: CLI arg, LLM_MODEL env, OPENAI_MODEL env (custom endpoint), or config
         self.model = model or os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or CLI_CONFIG["model"]["default"]
-        
-        # Base URL: custom endpoint (OPENAI_BASE_URL) takes precedence over OpenRouter
-        self.base_url = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", CLI_CONFIG["model"]["base_url"])
-        
-        # API key: custom endpoint (OPENAI_API_KEY) takes precedence over OpenRouter
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 
-        # Provider resolution: determines whether to use OAuth credentials or env var keys
-        from hermes_cli.auth import resolve_provider
+        self._explicit_api_key = api_key
+        self._explicit_base_url = base_url
+
+        # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
             provider
             or os.getenv("HERMES_INFERENCE_PROVIDER")
             or CLI_CONFIG["model"].get("provider")
             or "auto"
         )
-        self.provider = resolve_provider(
-            self.requested_provider,
-            explicit_api_key=api_key,
-            explicit_base_url=base_url,
+        self._provider_source: Optional[str] = None
+        self.provider = self.requested_provider
+        self.api_mode = "chat_completions"
+        self.base_url = (
+            base_url
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("OPENROUTER_BASE_URL", CLI_CONFIG["model"]["base_url"])
         )
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
         self._nous_key_expires_at: Optional[str] = None
         self._nous_key_source: Optional[str] = None
-        # Max turns priority: CLI arg > config file > env var > default
-        if max_turns is not None:
+        # Max turns priority: CLI arg > env var > config file (agent.max_turns or root max_turns) > default
+        if max_turns is not None:  # CLI arg was explicitly set
             self.max_turns = max_turns
         elif CLI_CONFIG["agent"].get("max_turns"):
             self.max_turns = CLI_CONFIG["agent"]["max_turns"]
@@ -903,45 +903,51 @@ class HermesCLI:
 
     def _ensure_runtime_credentials(self) -> bool:
         """
-        Ensure OAuth provider credentials are fresh before agent use.
-        For Nous Portal: checks agent key TTL, refreshes/re-mints as needed.
-        If the key changed, tears down the agent so it rebuilds with new creds.
+        Ensure runtime credentials are resolved before agent use.
+        Re-resolves provider credentials so key rotation and token refresh
+        are picked up without restarting the CLI.
         Returns True if credentials are ready, False on auth failure.
         """
-        if self.provider != "nous":
-            return True
-
-        from hermes_cli.auth import format_auth_error, resolve_nous_runtime_credentials
+        from hermes_cli.runtime_provider import (
+            resolve_runtime_provider,
+            format_runtime_provider_error,
+        )
 
         try:
-            credentials = resolve_nous_runtime_credentials(
-                min_key_ttl_seconds=max(
-                    60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))
-                ),
-                timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
+            runtime = resolve_runtime_provider(
+                requested=self.requested_provider,
+                explicit_api_key=self._explicit_api_key,
+                explicit_base_url=self._explicit_base_url,
             )
         except Exception as exc:
-            message = format_auth_error(exc)
+            message = format_runtime_provider_error(exc)
             self.console.print(f"[bold red]{message}[/]")
             return False
 
-        api_key = credentials.get("api_key")
-        base_url = credentials.get("base_url")
+        api_key = runtime.get("api_key")
+        base_url = runtime.get("base_url")
+        resolved_provider = runtime.get("provider", "openrouter")
+        resolved_api_mode = runtime.get("api_mode", self.api_mode)
         if not isinstance(api_key, str) or not api_key:
-            self.console.print("[bold red]Nous credential resolver returned an empty API key.[/]")
+            self.console.print("[bold red]Provider resolver returned an empty API key.[/]")
             return False
         if not isinstance(base_url, str) or not base_url:
-            self.console.print("[bold red]Nous credential resolver returned an empty base URL.[/]")
+            self.console.print("[bold red]Provider resolver returned an empty base URL.[/]")
             return False
 
         credentials_changed = api_key != self.api_key or base_url != self.base_url
+        routing_changed = (
+            resolved_provider != self.provider
+            or resolved_api_mode != self.api_mode
+        )
+        self.provider = resolved_provider
+        self.api_mode = resolved_api_mode
+        self._provider_source = runtime.get("source")
         self.api_key = api_key
         self.base_url = base_url
-        self._nous_key_expires_at = credentials.get("expires_at")
-        self._nous_key_source = credentials.get("source")
 
         # AIAgent/OpenAI client holds auth at init time, so rebuild if key rotated
-        if credentials_changed and self.agent is not None:
+        if (credentials_changed or routing_changed) and self.agent is not None:
             self.agent = None
 
         return True
@@ -957,7 +963,7 @@ class HermesCLI:
         if self.agent is not None:
             return True
 
-        if self.provider == "nous" and not self._ensure_runtime_credentials():
+        if not self._ensure_runtime_credentials():
             return False
 
         # Initialize SQLite session store for CLI sessions
@@ -1001,6 +1007,8 @@ class HermesCLI:
                 model=self.model,
                 api_key=self.api_key,
                 base_url=self.base_url,
+                provider=self.provider,
+                api_mode=self.api_mode,
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,
                 verbose_logging=self.verbose,
@@ -1093,8 +1101,8 @@ class HermesCLI:
             toolsets_info = f" [dim #B8860B]·[/] [#CD7F32]toolsets: {', '.join(self.enabled_toolsets)}[/]"
 
         provider_info = f" [dim #B8860B]·[/] [dim]provider: {self.provider}[/]"
-        if self.provider == "nous" and self._nous_key_source:
-            provider_info += f" [dim #B8860B]·[/] [dim]key: {self._nous_key_source}[/]"
+        if self._provider_source:
+            provider_info += f" [dim #B8860B]·[/] [dim]auth: {self._provider_source}[/]"
 
         self.console.print(
             f"  {api_indicator} [#FFBF00]{model_short}[/] "
@@ -1714,6 +1722,10 @@ class HermesCLI:
             self._show_gateway_status()
         elif cmd_lower == "/verbose":
             self._toggle_verbose()
+        elif cmd_lower == "/compress":
+            self._manual_compress()
+        elif cmd_lower == "/usage":
+            self._show_usage()
         else:
             # Check for skill slash commands (/gif-search, /axolotl, etc.)
             base_cmd = cmd_lower.split()[0]
@@ -1754,6 +1766,77 @@ class HermesCLI:
             "verbose": "[bold green]Tool progress: VERBOSE[/] — full args, results, and debug logs.",
         }
         self.console.print(labels.get(self.tool_progress_mode, ""))
+
+    def _manual_compress(self):
+        """Manually trigger context compression on the current conversation."""
+        if not self.conversation_history or len(self.conversation_history) < 4:
+            print("(._.) Not enough conversation to compress (need at least 4 messages).")
+            return
+
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+
+        if not self.agent.compression_enabled:
+            print("(._.) Compression is disabled in config.")
+            return
+
+        original_count = len(self.conversation_history)
+        try:
+            from agent.model_metadata import estimate_messages_tokens_rough
+            approx_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens)...")
+
+            compressed, new_system = self.agent._compress_context(
+                self.conversation_history,
+                self.agent._cached_system_prompt or "",
+                approx_tokens=approx_tokens,
+            )
+            self.conversation_history = compressed
+            new_count = len(self.conversation_history)
+            new_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            print(
+                f"  ✅ Compressed: {original_count} → {new_count} messages "
+                f"(~{approx_tokens:,} → ~{new_tokens:,} tokens)"
+            )
+        except Exception as e:
+            print(f"  ❌ Compression failed: {e}")
+
+    def _show_usage(self):
+        """Show cumulative token usage for the current session."""
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+
+        agent = self.agent
+        prompt = agent.session_prompt_tokens
+        completion = agent.session_completion_tokens
+        total = agent.session_total_tokens
+        calls = agent.session_api_calls
+
+        if calls == 0:
+            print("(._.) No API calls made yet in this session.")
+            return
+
+        # Current context window state
+        compressor = agent.context_compressor
+        last_prompt = compressor.last_prompt_tokens
+        ctx_len = compressor.context_length
+        pct = (last_prompt / ctx_len * 100) if ctx_len else 0
+        compressions = compressor.compression_count
+
+        msg_count = len(self.conversation_history)
+
+        print(f"  📊 Session Token Usage")
+        print(f"  {'─' * 40}")
+        print(f"  Prompt tokens (input):     {prompt:>10,}")
+        print(f"  Completion tokens (output): {completion:>9,}")
+        print(f"  Total tokens:              {total:>10,}")
+        print(f"  API calls:                 {calls:>10,}")
+        print(f"  {'─' * 40}")
+        print(f"  Current context:  {last_prompt:,} / {ctx_len:,} ({pct:.0f}%)")
+        print(f"  Messages:         {msg_count}")
+        print(f"  Compressions:     {compressions}")
 
         if self.verbose:
             logging.getLogger().setLevel(logging.DEBUG)
@@ -1929,8 +2012,8 @@ class HermesCLI:
         Returns:
             The agent's response, or None on error
         """
-        # Refresh OAuth credentials if needed (handles key rotation transparently)
-        if self.provider == "nous" and not self._ensure_runtime_credentials():
+        # Refresh provider credentials if needed (handles key rotation transparently)
+        if not self._ensure_runtime_credentials():
             return None
 
         # Initialize agent if needed
