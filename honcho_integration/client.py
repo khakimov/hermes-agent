@@ -177,13 +177,21 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
             "Install it with: pip install honcho-ai"
         )
 
-    logger.info("Initializing Honcho client (host: %s, workspace: %s)", config.host, config.workspace_id)
+    # If HONCHO_URL is set, don't pass environment so the SDK uses the URL
+    honcho_url = os.environ.get("HONCHO_URL")
+    kwargs: dict = {
+        "workspace_id": config.workspace_id,
+        "api_key": config.api_key,
+    }
+    if honcho_url:
+        kwargs["base_url"] = honcho_url
+    else:
+        kwargs["environment"] = config.environment
 
-    _honcho_client = Honcho(
-        workspace_id=config.workspace_id,
-        api_key=config.api_key,
-        environment=config.environment,
-    )
+    logger.info("Initializing Honcho client (host: %s, workspace: %s, url: %s)",
+                config.host, config.workspace_id, honcho_url or config.environment)
+
+    _honcho_client = Honcho(**kwargs)
 
     return _honcho_client
 
