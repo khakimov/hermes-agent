@@ -922,8 +922,12 @@ class GatewayRunner:
                         api_calls=agent_result.get("api_calls", 0),
                         history_len=len(agent_messages),
                     )
+                elif adapter:
+                    print(f"[StatusPin] Skipped: chat_type={source.chat_type!r} (not dm)")
             except Exception as e:
-                logger.debug("Status pin update failed: %s", e)
+                print(f"[StatusPin] Error: {e}")
+                import traceback
+                traceback.print_exc()
 
             return response
             
@@ -1062,10 +1066,12 @@ class GatewayRunner:
         )
 
         pin_info = self._pinned_status_msgs.get(session_key)
+        print(f"[StatusPin] chat_id={chat_id}, cached={pin_info is not None}")
 
         # On first call after restart, try to find existing pinned status msg
         if not pin_info:
             existing_id = await adapter.find_pinned_status_message(chat_id)
+            print(f"[StatusPin] find_pinned_status_message returned: {existing_id}")
             if existing_id:
                 pin_info = {"chat_id": chat_id, "message_id": existing_id}
                 self._pinned_status_msgs[session_key] = pin_info
@@ -1077,16 +1083,18 @@ class GatewayRunner:
                 message_id=pin_info["message_id"],
                 content=content,
             )
+            print(f"[StatusPin] edit result: success={result.success}, error={result.error}")
             if result.success:
                 return
             # If edit failed (message deleted?), fall through to send a new one
             self._pinned_status_msgs.pop(session_key, None)
-            logger.debug("Failed to edit pinned status msg: %s", result.error)
 
         # Send a new status message and pin it
         result = await adapter.send(chat_id=chat_id, content=content)
+        print(f"[StatusPin] send result: success={result.success}, msg_id={result.message_id}")
         if result.success and result.message_id:
             pinned = await adapter.pin_message(chat_id, result.message_id)
+            print(f"[StatusPin] pin result: {pinned}")
             if pinned:
                 self._pinned_status_msgs[session_key] = {
                     "chat_id": chat_id,
