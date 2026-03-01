@@ -336,6 +336,32 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("Failed to pin message in %s: %s", chat_id, e)
             return False
 
+    async def find_pinned_status_message(self, chat_id: str) -> Optional[str]:
+        """Find an existing bot-sent status pin in a chat.
+
+        Returns the message_id as a string if found, None otherwise.
+        """
+        if not self._bot:
+            return None
+
+        try:
+            chat = await self._bot.get_chat(int(chat_id))
+            pinned = chat.pinned_message
+            if not pinned:
+                return None
+            # Check it was sent by us and looks like a status message
+            if (
+                pinned.from_user
+                and pinned.from_user.id == self._bot.id
+                and pinned.text
+                and pinned.text.startswith("📊 Session Status")
+            ):
+                return str(pinned.message_id)
+        except Exception as e:
+            logger.debug("Could not check pinned message in %s: %s", chat_id, e)
+
+        return None
+
     async def send_typing(self, chat_id: str) -> None:
         """Send typing indicator."""
         if self._bot:

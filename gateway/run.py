@@ -1063,6 +1063,13 @@ class GatewayRunner:
 
         pin_info = self._pinned_status_msgs.get(session_key)
 
+        # On first call after restart, try to find existing pinned status msg
+        if not pin_info:
+            existing_id = await adapter.find_pinned_status_message(chat_id)
+            if existing_id:
+                pin_info = {"chat_id": chat_id, "message_id": existing_id}
+                self._pinned_status_msgs[session_key] = pin_info
+
         if pin_info:
             # Edit the existing pinned message
             result = await adapter.edit_message(
@@ -1073,6 +1080,7 @@ class GatewayRunner:
             if result.success:
                 return
             # If edit failed (message deleted?), fall through to send a new one
+            self._pinned_status_msgs.pop(session_key, None)
             logger.debug("Failed to edit pinned status msg: %s", result.error)
 
         # Send a new status message and pin it

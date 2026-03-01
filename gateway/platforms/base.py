@@ -422,6 +422,15 @@ class BasePlatformAdapter(ABC):
         """
         return False
 
+    async def find_pinned_status_message(self, chat_id: str) -> Optional[str]:
+        """
+        Find an existing bot-sent status pin in a chat.
+
+        Override in subclasses if the platform supports it.
+        Returns the message_id as a string if found, None otherwise.
+        """
+        return None
+
     async def send_typing(self, chat_id: str) -> None:
         """
         Send a typing indicator.
