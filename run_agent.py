@@ -436,6 +436,8 @@ class AIAgent:
             try:
                 from honcho_integration.client import HonchoClientConfig, get_honcho_client
                 hcfg = HonchoClientConfig.from_global_config()
+                logger.info("Honcho config: enabled=%s, api_key=%s, env=%s, workspace=%s",
+                            hcfg.enabled, bool(hcfg.api_key), hcfg.environment, hcfg.workspace_id)
                 if hcfg.enabled and hcfg.api_key:
                     from honcho_integration.session import HonchoSessionManager
                     client = get_honcho_client(hcfg)
@@ -461,11 +463,11 @@ class AIAgent:
                     )
                 else:
                     if not hcfg.enabled:
-                        logger.debug("Honcho disabled in global config")
+                        logger.info("Honcho disabled in global config (enabled=%s)", hcfg.enabled)
                     elif not hcfg.api_key:
-                        logger.debug("Honcho enabled but no API key configured")
+                        logger.info("Honcho enabled but no API key configured")
             except Exception as e:
-                logger.debug("Honcho init failed (non-fatal): %s", e)
+                logger.info("Honcho init failed (non-fatal): %s", e)
                 self._honcho = None
 
         # Skills config: nudge interval for skill creation reminders
