@@ -97,6 +97,7 @@ def _discover_tools():
         "tools.send_message_tool",
         "tools.honcho_tools",
         "tools.google_places_tool",
+        "tools.reload_tools",
     ]
     import importlib
     for mod_name in _modules:

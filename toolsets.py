@@ -62,6 +62,8 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Honcho user context (gated on honcho being active via check_fn)
     "query_user_context",
+    # Dynamic tool loading
+    "reload_tools",
 ]
 
 
