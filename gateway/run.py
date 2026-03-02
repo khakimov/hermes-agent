@@ -1790,7 +1790,7 @@ class GatewayRunner:
         progress_queue = queue.Queue() if tool_progress_enabled else None
         last_tool = [None]  # Mutable container for tracking in closure
         
-        def progress_callback(tool_name: str, preview: str = None):
+        def progress_callback(tool_name: str, preview: str = None, args: dict = None):
             """Callback invoked by agent when a tool is called."""
             if not progress_queue:
                 return
@@ -1810,6 +1810,7 @@ class GatewayRunner:
                 "write_file": "✍️",
                 "patch": "🔧",
                 "search": "🔎",
+                "search_files": "🔎",
                 "list_directory": "📂",
                 "image_generate": "🎨",
                 "text_to_speech": "🔊",
@@ -1835,14 +1836,28 @@ class GatewayRunner:
                 "schedule_cronjob": "⏰",
                 "list_cronjobs": "⏰",
                 "remove_cronjob": "⏰",
+                "execute_code": "🐍",
+                "delegate_task": "🔀",
+                "clarify": "❓",
+                "skill_manage": "📝",
             }
             emoji = tool_emojis.get(tool_name, "⚙️")
             
+            # Verbose mode: show detailed arguments
+            if progress_mode == "verbose" and args:
+                import json as _json
+                args_str = _json.dumps(args, ensure_ascii=False, default=str)
+                if len(args_str) > 200:
+                    args_str = args_str[:197] + "..."
+                msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                progress_queue.put(msg)
+                return
+            
             if preview:
                 # Truncate preview to keep messages clean
-                if len(preview) > 40:
-                    preview = preview[:37] + "..."
-                msg = f"{emoji} {tool_name}... \"{preview}\""
+                if len(preview) > 80:
+                    preview = preview[:77] + "..."
+                msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
                 msg = f"{emoji} {tool_name}..."
             
