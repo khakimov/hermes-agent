@@ -34,6 +34,7 @@ _DEFAULT_FIELDS = [
     "places.currentOpeningHours",
     "places.priceLevel",
     "places.editorialSummary",
+    "places.reviewSummary",
     "places.location",
 ]
 
@@ -51,6 +52,7 @@ _DETAIL_FIELDS = [
     "regularOpeningHours",
     "priceLevel",
     "editorialSummary",
+    "reviewSummary",
     "reviews",
     "location",
     "googleMapsUri",
@@ -86,6 +88,28 @@ def _format_place(place: dict) -> dict:
         result["location"] = {"lat": loc.get("latitude"), "lng": loc.get("longitude")}
     if maps_uri := place.get("googleMapsUri"):
         result["google_maps_url"] = maps_uri
+    # AI-powered review summary (Gemini-generated from user reviews)
+    if rs := place.get("reviewSummary"):
+        summary_obj = {}
+        if text := rs.get("text"):
+            summary_obj["text"] = text.get("text", "")
+        if disclosure := rs.get("disclosureText"):
+            summary_obj["disclosure"] = disclosure.get("text", "")
+        if reviews_uri := rs.get("reviewsUri"):
+            summary_obj["reviews_url"] = reviews_uri
+        if summary_obj:
+            result["review_summary"] = summary_obj
+    # Individual user reviews (details action only)
+    if reviews := place.get("reviews"):
+        result["reviews"] = [
+            {
+                "author": r.get("authorAttribution", {}).get("displayName", ""),
+                "rating": r.get("rating"),
+                "text": r.get("text", {}).get("text", ""),
+                "time": r.get("publishTime", ""),
+            }
+            for r in reviews[:10]  # cap to avoid huge payloads
+        ]
     return result
 
 
@@ -184,7 +208,8 @@ GOOGLE_PLACES_SCHEMA = {
     "description": (
         "Search for places, get place details, or find nearby places using Google Places API. "
         "Actions: 'search' (text search), 'nearby' (lat/lng radius search), 'details' (get full info by place_id). "
-        "Returns name, address, rating, phone, website, opening hours, price level, and more."
+        "Returns name, address, rating, phone, website, opening hours, price level, AI-powered review summaries, "
+        "and individual user reviews (in details mode)."
     ),
     "parameters": {
         "type": "object",
