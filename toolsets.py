@@ -30,7 +30,7 @@ from typing import List, Dict, Any, Set, Optional
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [
     # Web
-    "web_search", "web_extract", "serper_search", "kimi",
+    "web_search", "web_extract", "serper_search", "google_places", "kimi",
     # Terminal + process management
     "terminal", "process",
     # File manipulation
@@ -71,7 +71,7 @@ TOOLSETS = {
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",
-        "tools": ["web_search", "web_extract", "serper_search"],
+        "tools": ["web_search", "web_extract", "serper_search", "google_places"],
         "includes": []  # No other toolsets included
     },
 
