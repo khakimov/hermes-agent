@@ -2573,6 +2573,12 @@ class AIAgent:
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 tool_duration = time.time() - tool_start_time
 
+            # Ensure function_result is always a string — tool handlers
+            # should return JSON strings, but a misbehaving handler might
+            # return a dict/list which would crash slicing below.
+            if not isinstance(function_result, str):
+                function_result = json.dumps(function_result, ensure_ascii=False)
+
             result_preview = function_result[:200] if len(function_result) > 200 else function_result
 
             # Log tool errors to the persistent error log so [error] tags

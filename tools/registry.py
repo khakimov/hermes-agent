@@ -122,8 +122,13 @@ class ToolRegistry:
         try:
             if entry.is_async:
                 from model_tools import _run_async
-                return _run_async(entry.handler(args, **kwargs))
-            return entry.handler(args, **kwargs)
+                result = _run_async(entry.handler(args, **kwargs))
+            else:
+                result = entry.handler(args, **kwargs)
+            # Handlers must return JSON strings; coerce if they return a dict/list
+            if not isinstance(result, str):
+                result = json.dumps(result, ensure_ascii=False)
+            return result
         except Exception as e:
             logger.error("Tool %s dispatch error: %s", name, e)
             return json.dumps({"error": f"Tool execution failed: {type(e).__name__}: {e}"})
