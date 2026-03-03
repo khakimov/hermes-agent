@@ -34,7 +34,12 @@ import os
 import asyncio
 import datetime
 from typing import Dict, Any, Optional, Union
-import fal_client
+
+try:
+    import fal_client
+except ImportError:
+    fal_client = None  # Resolved lazily; check_image_generation_requirements gates usage
+
 from tools.debug_helpers import DebugSession
 
 logger = logging.getLogger(__name__)
