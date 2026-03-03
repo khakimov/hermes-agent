@@ -438,6 +438,10 @@ class GatewayRunner:
         
         self._running = True
         
+        # Enable sync→async hook bridge for tool handlers (e.g. reload_tools)
+        from gateway.hooks import set_global_hook_bridge
+        set_global_hook_bridge(self.hooks, asyncio.get_event_loop())
+
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:

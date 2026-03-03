@@ -63,6 +63,7 @@ The handler function:
 | `agent:step` | Each iteration of the tool-calling loop | `platform`, `user_id`, `session_id`, `iteration`, `tool_names` |
 | `agent:end` | Agent finishes processing | `platform`, `user_id`, `session_id`, `message`, `response` |
 | `command:*` | Any slash command executed | `platform`, `user_id`, `command`, `args` |
+| `tool:reload` | Dynamic tool module loaded/reloaded via `reload_tools` | `action`, `module`, `new_tools`, `removed_tools`, `toolset` |
 
 ### Wildcard Matching
 

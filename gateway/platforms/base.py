@@ -454,33 +454,35 @@ class BasePlatformAdapter(ABC):
         image_url: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """
         Send an image natively via the platform API.
-        
+
         Override in subclasses to send images as proper attachments
         instead of plain-text URLs. Default falls back to sending the
         URL as a text message.
         """
         # Fallback: send URL as text (subclasses override for native images)
         text = f"{caption}\n{image_url}" if caption else image_url
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
-    
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+
     async def send_animation(
         self,
         chat_id: str,
         animation_url: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """
         Send an animated GIF natively via the platform API.
-        
+
         Override in subclasses to send GIFs as proper animations
         (e.g., Telegram send_animation) so they auto-play inline.
         Default falls back to send_image.
         """
-        return await self.send_image(chat_id=chat_id, image_url=animation_url, caption=caption, reply_to=reply_to)
+        return await self.send_image(chat_id=chat_id, image_url=animation_url, caption=caption, reply_to=reply_to, metadata=metadata)
     
     @staticmethod
     def _is_animation_url(url: str) -> bool:
@@ -538,10 +540,11 @@ class BasePlatformAdapter(ABC):
         audio_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """
         Send an audio file as a native voice message via the platform API.
-        
+
         Override in subclasses to send audio as voice bubbles (Telegram)
         or file attachments (Discord). Default falls back to sending the
         file path as text.
@@ -549,7 +552,7 @@ class BasePlatformAdapter(ABC):
         text = f"🔊 Audio: {audio_path}"
         if caption:
             text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
     
     @staticmethod
     def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
@@ -666,19 +669,26 @@ class BasePlatformAdapter(ABC):
             if response:
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
-                
+
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
-                
+
+                # Build metadata once — passes thread_id so forum/topic
+                # replies land in the correct topic instead of General.
+                _send_meta = None
+                if event.source.thread_id:
+                    _send_meta = {"thread_id": event.source.thread_id}
+
                 # Send the text portion first (if any remains after extractions)
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     result = await self.send(
                         chat_id=event.source.chat_id,
                         content=text_content,
-                        reply_to=event.message_id
+                        reply_to=event.message_id,
+                        metadata=_send_meta,
                     )
-                    
+
                     # Log send failures (don't raise - user already saw tool progress)
                     if not result.success:
                         print(f"[{self.name}] Failed to send response: {result.error}")
@@ -686,14 +696,15 @@ class BasePlatformAdapter(ABC):
                         fallback_result = await self.send(
                             chat_id=event.source.chat_id,
                             content=f"(Response formatting failed, plain text:)\n\n{text_content[:3500]}",
-                            reply_to=event.message_id
+                            reply_to=event.message_id,
+                            metadata=_send_meta,
                         )
                         if not fallback_result.success:
                             print(f"[{self.name}] Fallback send also failed: {fallback_result.error}")
-                
+
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
-                
+
                 # Send extracted images as native attachments
                 for image_url, alt_text in images:
                     if human_delay > 0:
@@ -705,18 +716,20 @@ class BasePlatformAdapter(ABC):
                                 chat_id=event.source.chat_id,
                                 animation_url=image_url,
                                 caption=alt_text if alt_text else None,
+                                metadata=_send_meta,
                             )
                         else:
                             img_result = await self.send_image(
                                 chat_id=event.source.chat_id,
                                 image_url=image_url,
                                 caption=alt_text if alt_text else None,
+                                metadata=_send_meta,
                             )
                         if not img_result.success:
                             print(f"[{self.name}] Failed to send image: {img_result.error}")
                     except Exception as img_err:
                         print(f"[{self.name}] Error sending image: {img_err}")
-                
+
                 # Send extracted audio/voice files as native attachments
                 for audio_path, is_voice in media_files:
                     if human_delay > 0:
@@ -725,6 +738,7 @@ class BasePlatformAdapter(ABC):
                         voice_result = await self.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=audio_path,
+                            metadata=_send_meta,
                         )
                         if not voice_result.success:
                             print(f"[{self.name}] Failed to send voice: {voice_result.error}")

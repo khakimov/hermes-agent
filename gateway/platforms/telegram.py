@@ -192,9 +192,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception as md_error:
                     # Markdown parsing failed, try plain text
                     if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                        # Strip MarkdownV2 escaping so backslashes don't show
+                        # literally in the plain-text fallback.
+                        plain_chunk = re.sub(
+                            r'\\([_*\[\]()~`>#\+\-=|{}.!\\])',
+                            r'\1',
+                            chunk,
+                        )
                         msg = await self._bot.send_message(
                             chat_id=int(chat_id),
-                            text=chunk,
+                            text=plain_chunk,
                             parse_mode=None,  # Plain text
                             reply_to_message_id=int(reply_to) if reply_to and i == 0 else None,
                             message_thread_id=int(thread_id) if thread_id else None,
@@ -218,16 +225,18 @@ class TelegramAdapter(BasePlatformAdapter):
         audio_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        thread_id = metadata.get("thread_id") if metadata else None
         try:
             import os
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
-            
+
             with open(audio_path, "rb") as audio_file:
                 # .ogg files -> send as voice (round playable bubble)
                 if audio_path.endswith(".ogg") or audio_path.endswith(".opus"):
@@ -236,6 +245,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         voice=audio_file,
                         caption=caption[:1024] if caption else None,
                         reply_to_message_id=int(reply_to) if reply_to else None,
+                        message_thread_id=int(thread_id) if thread_id else None,
                     )
                 else:
                     # .mp3 and others -> send as audio file
@@ -244,11 +254,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         audio=audio_file,
                         caption=caption[:1024] if caption else None,
                         reply_to_message_id=int(reply_to) if reply_to else None,
+                        message_thread_id=int(thread_id) if thread_id else None,
                     )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             print(f"[{self.name}] Failed to send voice/audio: {e}")
-            return await super().send_voice(chat_id, audio_path, caption, reply_to)
+            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata)
     
     async def send_image(
         self,
@@ -256,11 +267,13 @@ class TelegramAdapter(BasePlatformAdapter):
         image_url: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an image natively as a Telegram photo."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        thread_id = metadata.get("thread_id") if metadata else None
         try:
             # Telegram can send photos directly from URLs
             msg = await self._bot.send_photo(
@@ -268,12 +281,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 photo=image_url,
                 caption=caption[:1024] if caption else None,  # Telegram caption limit
                 reply_to_message_id=int(reply_to) if reply_to else None,
+                message_thread_id=int(thread_id) if thread_id else None,
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             print(f"[{self.name}] Failed to send photo, falling back to URL: {e}")
             # Fallback: send as text link
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
     
     async def send_animation(
         self,
@@ -281,23 +295,26 @@ class TelegramAdapter(BasePlatformAdapter):
         animation_url: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an animated GIF natively as a Telegram animation (auto-plays inline)."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        thread_id = metadata.get("thread_id") if metadata else None
         try:
             msg = await self._bot.send_animation(
                 chat_id=int(chat_id),
                 animation=animation_url,
                 caption=caption[:1024] if caption else None,
                 reply_to_message_id=int(reply_to) if reply_to else None,
+                message_thread_id=int(thread_id) if thread_id else None,
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             print(f"[{self.name}] Failed to send animation, falling back to photo: {e}")
             # Fallback: try as a regular photo
-            return await self.send_image(chat_id, animation_url, caption, reply_to)
+            return await self.send_image(chat_id, animation_url, caption, reply_to, metadata)
 
     async def edit_message(
         self,

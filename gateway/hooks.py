@@ -16,18 +16,57 @@ Events:
   - command:*           -- Any slash command executed (wildcard match)
 
 Errors in hooks are caught and logged but never block the main pipeline.
+
+New events:
+  - tool:reload          -- Dynamic tool module loaded/reloaded via reload_tools
 """
 
 import asyncio
 import importlib.util
+import logging
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import yaml
 
+logger = logging.getLogger(__name__)
 
 HOOKS_DIR = Path(os.path.expanduser("~/.hermes/hooks"))
+
+# Module-level bridge so sync tool code can fire hooks without holding a
+# reference to the gateway's HookRegistry or event loop.  The gateway calls
+# set_global_hook_bridge() during startup; in CLI mode these stay None and
+# emit_sync() is a no-op.
+_global_hooks: Optional["HookRegistry"] = None
+_global_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def set_global_hook_bridge(
+    hook_registry: "HookRegistry",
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Called by the gateway at startup to enable emit_sync() for tool code."""
+    global _global_hooks, _global_loop
+    _global_hooks = hook_registry
+    _global_loop = loop
+
+
+def emit_sync(event_type: str, context: Optional[Dict[str, Any]] = None) -> None:
+    """Fire a hook event from synchronous (tool handler) code.
+
+    Safe to call from any context — no-ops silently when no hook bridge is
+    configured (e.g. CLI mode, tests).
+    """
+    if _global_hooks is None or _global_loop is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(
+            _global_hooks.emit(event_type, context or {}),
+            _global_loop,
+        )
+    except Exception as exc:
+        logger.debug("emit_sync(%s) failed: %s", event_type, exc)
 
 
 class HookRegistry:

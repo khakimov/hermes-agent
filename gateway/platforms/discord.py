@@ -213,26 +213,27 @@ class DiscordAdapter(BasePlatformAdapter):
         audio_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send audio as a Discord file attachment."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
-        
+
         try:
             import io
-            
+
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
-            
+
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
-            
+
             # Determine filename from path
             filename = os.path.basename(audio_path)
-            
+
             with open(audio_path, "rb") as f:
                 file = discord.File(io.BytesIO(f.read()), filename=filename)
                 msg = await channel.send(
@@ -240,10 +241,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     file=file,
                 )
                 return SendResult(success=True, message_id=str(msg.id))
-        
+
         except Exception as e:
             print(f"[{self.name}] Failed to send audio: {e}")
-            return await super().send_voice(chat_id, audio_path, caption, reply_to)
+            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata)
     
     async def send_image(
         self,
@@ -251,6 +252,7 @@ class DiscordAdapter(BasePlatformAdapter):
         image_url: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an image natively as a Discord file attachment."""
         if not self._client:
@@ -295,10 +297,10 @@ class DiscordAdapter(BasePlatformAdapter):
         
         except ImportError:
             print(f"[{self.name}] aiohttp not installed, falling back to URL. Run: pip install aiohttp")
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
         except Exception as e:
             print(f"[{self.name}] Failed to send image attachment, falling back to URL: {e}")
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
     
     async def send_typing(self, chat_id: str) -> None:
         """Send typing indicator."""

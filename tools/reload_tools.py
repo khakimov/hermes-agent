@@ -239,6 +239,19 @@ def reload_tools_handler(args: Dict[str, Any], **kwargs) -> str:
         action, module_name, new_tools,
     )
 
+    # --- Fire tool:reload hook (no-ops in CLI mode) ---
+    try:
+        from gateway.hooks import emit_sync
+        emit_sync("tool:reload", {
+            "action": action,
+            "module": module_name,
+            "new_tools": new_tools,
+            "removed_tools": removed_tools,
+            "toolset": toolset,
+        })
+    except Exception:
+        pass  # gateway not installed or not running — fine
+
     result = {
         "status": "ok",
         "action": action,
