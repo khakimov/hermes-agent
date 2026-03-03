@@ -61,12 +61,12 @@ def _scan_context_content(content: str, filename: str) -> str:
 # =========================================================================
 
 DEFAULT_AGENT_IDENTITY = (
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
-    "You are helpful, knowledgeable, and direct. You assist users with a wide "
-    "range of tasks including answering questions, writing and editing code, "
-    "analyzing information, creative work, and executing actions via your tools. "
-    "You communicate clearly, admit uncertainty when appropriate, and prioritize "
-    "being genuinely useful over being verbose unless otherwise directed below."
+    "You are Hermes Agent, an AI teammate created by Nous Research. "
+    "Be practical, direct, and trustworthy. Focus on what helps the user move "
+    "forward: concrete next actions, clear tradeoffs, and specific answers. "
+    "Write naturally and avoid repetitive assistant boilerplate. "
+    "Ask clarifying questions only when needed to avoid a wrong or risky action. "
+    "If you are uncertain, say so plainly and propose the fastest way to verify."
 )
 
 MEMORY_GUIDANCE = (
@@ -108,6 +108,10 @@ PLATFORM_HINTS = {
 CONTEXT_FILE_MAX_CHARS = 20_000
 CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
 CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
+CONTEXT_PROMPT_SMART_BUDGET_CHARS = 8_000
+CONTEXT_PROMPT_FULL_BUDGET_CHARS = 24_000
+# Smart mode: include top-level AGENTS.md (if present) plus up to N nested files.
+SMART_MAX_NESTED_AGENTS_MD_FILES = 2
 
 
 # =========================================================================
@@ -224,14 +228,38 @@ def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE
     return head + marker + tail
 
 
-def build_context_files_prompt(cwd: Optional[str] = None) -> str:
+def build_context_files_prompt(
+    cwd: Optional[str] = None,
+    mode: str = "smart",
+    max_total_chars: Optional[int] = None,
+) -> str:
     """Discover and load context files for the system prompt.
 
     Discovery: AGENTS.md (recursive), .cursorrules / .cursor/rules/*.mdc,
-    SOUL.md (cwd then ~/.hermes/ fallback). Each capped at 20,000 chars.
+    SOUL.md (cwd then ~/.hermes/ fallback).
+
+    Modes:
+    - smart: load top-level AGENTS.md plus a small number of nested files,
+      then trim to a tighter total budget.
+    - full: load all discovered context files and use a larger total budget.
+    - off: disable context injection entirely.
     """
     if cwd is None:
         cwd = os.getcwd()
+
+    mode_normalized = (mode or "smart").strip().lower()
+    if mode_normalized == "off":
+        return ""
+    if mode_normalized not in {"smart", "full"}:
+        mode_normalized = "smart"
+
+    if max_total_chars is None:
+        max_total_chars = (
+            CONTEXT_PROMPT_SMART_BUDGET_CHARS
+            if mode_normalized == "smart"
+            else CONTEXT_PROMPT_FULL_BUDGET_CHARS
+        )
+    per_section_max_chars = min(CONTEXT_FILE_MAX_CHARS, max_total_chars)
 
     cwd_path = Path(cwd).resolve()
     sections = []
@@ -245,13 +273,34 @@ def build_context_files_prompt(cwd: Optional[str] = None) -> str:
             break
 
     if top_level_agents:
-        agents_files = []
-        for root, dirs, files in os.walk(cwd_path):
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', '__pycache__', 'venv', '.venv')]
-            for f in files:
-                if f.lower() == "agents.md":
-                    agents_files.append(Path(root) / f)
-        agents_files.sort(key=lambda p: len(p.parts))
+        if mode_normalized == "smart":
+            agents_files = [top_level_agents]
+            nested_candidates = []
+            for root, dirs, files in os.walk(cwd_path):
+                dirs[:] = sorted(
+                    d for d in dirs
+                    if not d.startswith('.') and d not in ('node_modules', '__pycache__', 'venv', '.venv')
+                )
+                files = sorted(files)
+                root_path = Path(root)
+                if root_path == cwd_path:
+                    continue
+                for f in files:
+                    if f.lower() == "agents.md":
+                        nested_candidates.append(root_path / f)
+                        if len(nested_candidates) >= SMART_MAX_NESTED_AGENTS_MD_FILES:
+                            break
+                if len(nested_candidates) >= SMART_MAX_NESTED_AGENTS_MD_FILES:
+                    break
+            agents_files.extend(nested_candidates)
+        else:
+            agents_files = []
+            for root, dirs, files in os.walk(cwd_path):
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', '__pycache__', 'venv', '.venv')]
+                for f in files:
+                    if f.lower() == "agents.md":
+                        agents_files.append(Path(root) / f)
+            agents_files.sort(key=lambda p: len(p.parts))
 
         total_agents_content = ""
         for agents_path in agents_files:
@@ -265,7 +314,11 @@ def build_context_files_prompt(cwd: Optional[str] = None) -> str:
                 logger.debug("Could not read %s: %s", agents_path, e)
 
         if total_agents_content:
-            total_agents_content = _truncate_content(total_agents_content, "AGENTS.md")
+            total_agents_content = _truncate_content(
+                total_agents_content,
+                "AGENTS.md",
+                max_chars=per_section_max_chars,
+            )
             sections.append(total_agents_content)
 
     # .cursorrules
@@ -293,7 +346,11 @@ def build_context_files_prompt(cwd: Optional[str] = None) -> str:
                 logger.debug("Could not read %s: %s", mdc_file, e)
 
     if cursorrules_content:
-        cursorrules_content = _truncate_content(cursorrules_content, ".cursorrules")
+        cursorrules_content = _truncate_content(
+            cursorrules_content,
+            ".cursorrules",
+            max_chars=per_section_max_chars,
+        )
         sections.append(cursorrules_content)
 
     # SOUL.md (cwd first, then ~/.hermes/ fallback)
@@ -313,7 +370,7 @@ def build_context_files_prompt(cwd: Optional[str] = None) -> str:
             content = soul_path.read_text(encoding="utf-8").strip()
             if content:
                 content = _scan_context_content(content, "SOUL.md")
-                content = _truncate_content(content, "SOUL.md")
+                content = _truncate_content(content, "SOUL.md", max_chars=per_section_max_chars)
                 sections.append(
                     f"## SOUL.md\n\nIf SOUL.md is present, embody its persona and tone. "
                     f"Avoid stiff, generic replies; follow its guidance unless higher-priority "
@@ -324,4 +381,7 @@ def build_context_files_prompt(cwd: Optional[str] = None) -> str:
 
     if not sections:
         return ""
-    return "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
+    body = "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
+    if len(body) > max_total_chars:
+        return _truncate_content(body, "Project Context", max_chars=max_total_chars)
+    return body

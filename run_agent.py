@@ -138,6 +138,8 @@ class AIAgent:
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         skip_context_files: bool = False,
+        context_files_mode: str = "smart",
+        context_files_max_chars: int = None,
         skip_memory: bool = False,
         session_db=None,
         honcho_session_key: str = None,
@@ -180,6 +182,9 @@ class AIAgent:
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
+            context_files_mode (str): Context file injection mode: "smart" (default), "full", or "off".
+                "smart" limits AGENTS.md fanout and applies a tighter total prompt budget.
+            context_files_max_chars (int): Optional total char budget override for context-file injection.
             honcho_session_key (str): Session key for Honcho integration (e.g., "telegram:123456" or CLI session_id).
                 When provided and Honcho is enabled in config, enables persistent cross-session user modeling.
         """
@@ -192,6 +197,10 @@ class AIAgent:
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self.skip_context_files = skip_context_files
+        # Backward compatibility: skip_context_files=True is equivalent to mode="off".
+        normalized_mode = (context_files_mode or "smart").strip().lower()
+        self.context_files_mode = "off" if skip_context_files else normalized_mode
+        self.context_files_max_chars = context_files_max_chars
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
@@ -1372,7 +1381,10 @@ class AIAgent:
             prompt_parts.append(skills_prompt)
 
         if not self.skip_context_files:
-            context_files_prompt = build_context_files_prompt()
+            context_files_prompt = build_context_files_prompt(
+                mode=self.context_files_mode,
+                max_total_chars=self.context_files_max_chars,
+            )
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
 

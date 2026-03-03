@@ -11,6 +11,7 @@ from agent.prompt_builder import (
     build_skills_system_prompt,
     build_context_files_prompt,
     CONTEXT_FILE_MAX_CHARS,
+    CONTEXT_PROMPT_SMART_BUDGET_CHARS,
     DEFAULT_AGENT_IDENTITY,
     PLATFORM_HINTS,
 )
@@ -212,6 +213,19 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Top level" in result
         assert "Src-specific" in result
+
+    def test_off_mode_disables_context_injection(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("Top level instructions.")
+        result = build_context_files_prompt(cwd=str(tmp_path), mode="off")
+        assert result == ""
+
+    def test_smart_mode_enforces_total_budget(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("x" * (CONTEXT_PROMPT_SMART_BUDGET_CHARS + 400))
+        result = build_context_files_prompt(cwd=str(tmp_path), mode="smart")
+        # _truncate_content injects a marker line, so final size can be slightly
+        # above the raw budget target while still being correctly budgeted.
+        assert len(result) <= CONTEXT_PROMPT_SMART_BUDGET_CHARS + 200
+        assert "truncated" in result.lower()
 
 
 # =========================================================================
