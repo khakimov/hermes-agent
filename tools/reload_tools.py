@@ -38,6 +38,11 @@ _BUILTIN_TOOL_NAMES = frozenset(registry.get_all_tool_names())
 # and proper cleanup when a module removes tools or changes toolset.
 _MODULE_TOOL_MAP: Dict[str, dict] = {}  # {module: {"tools": set, "toolset": str}}
 
+# Signal flag: set to True after a successful reload so the agent loop
+# can refresh its tool list on the next iteration.  Checked and cleared
+# by ``consume_tools_dirty()`` in run_agent.py.
+_tools_dirty: bool = False
+
 # Internal modules that must never be reloaded via this tool.
 _PROTECTED_MODULES = frozenset({
     "tools.registry",
@@ -234,6 +239,10 @@ def reload_tools_handler(args: Dict[str, Any], **kwargs) -> str:
     except Exception as exc:
         logger.debug("Could not refresh model_tools constants: %s", exc)
 
+    # Signal the agent loop to refresh its tool list on the next iteration.
+    global _tools_dirty
+    _tools_dirty = True
+
     logger.info(
         "reload_tools: %s module '%s' — tools: %s",
         action, module_name, new_tools,
@@ -269,6 +278,15 @@ def reload_tools_handler(args: Dict[str, Any], **kwargs) -> str:
         )
 
     return json.dumps(result, ensure_ascii=False)
+
+
+def consume_tools_dirty() -> bool:
+    """Return True (and reset) if reload_tools has fired since last check."""
+    global _tools_dirty
+    if _tools_dirty:
+        _tools_dirty = False
+        return True
+    return False
 
 
 def check_reload_tools_requirements() -> bool:

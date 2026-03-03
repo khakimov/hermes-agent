@@ -66,6 +66,7 @@ os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 
 # Import our tool system
 from model_tools import get_tool_definitions, handle_function_call, check_toolset_requirements
+from tools.reload_tools import consume_tools_dirty as _consume_tools_dirty
 from tools.terminal_tool import cleanup_vm
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
@@ -550,6 +551,23 @@ class AIAgent:
             else:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
     
+    def _refresh_tools(self):
+        """Re-fetch tool definitions from the live registry after a reload.
+
+        Called after ``reload_tools`` so newly loaded tools are available to
+        the LLM on the very next API call within the same session.
+        """
+        new_tools = get_tool_definitions(
+            enabled_toolsets=self.enabled_toolsets,
+            disabled_toolsets=self.disabled_toolsets,
+            quiet_mode=True,
+        )
+        if new_tools is not None:
+            self.tools = new_tools
+            self.valid_tool_names = {t["function"]["name"] for t in self.tools}
+            if not self.quiet_mode:
+                print(f"🔄 Tools refreshed: {len(self.tools)} tools available")
+
     def _max_tokens_param(self, value: int) -> dict:
         """Return the correct max tokens kwarg for the current provider.
         
@@ -2615,6 +2633,11 @@ class AIAgent:
             if not self.quiet_mode:
                 response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
+
+            # After reload_tools, refresh the live tool list so the LLM
+            # can call newly loaded tools on its very next turn.
+            if function_name == "reload_tools" and _consume_tools_dirty():
+                self._refresh_tools()
 
             if self._interrupt_requested and i < len(assistant_message.tool_calls):
                 remaining = len(assistant_message.tool_calls) - i
