@@ -14,6 +14,7 @@ Usage:
 
 import logging
 import os
+import shutil
 import sys
 import json
 import atexit
@@ -157,6 +158,7 @@ def load_cli_config() -> Dict[str, Any]:
             "docker_image": "python:3.11",
             "singularity_image": "docker://python:3.11",
             "modal_image": "python:3.11",
+            "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
         },
         "browser": {
             "inactivity_timeout": 120,  # Auto-cleanup inactive browser sessions after 2 min
@@ -283,12 +285,13 @@ def load_cli_config() -> Dict[str, Any]:
         "docker_image": "TERMINAL_DOCKER_IMAGE",
         "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
+        "daytona_image": "TERMINAL_DAYTONA_IMAGE",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",
         "ssh_port": "TERMINAL_SSH_PORT",
         "ssh_key": "TERMINAL_SSH_KEY",
-        # Container resource config (docker, singularity, modal -- ignored for local/ssh)
+        # Container resource config (docker, singularity, modal, daytona -- ignored for local/ssh)
         "container_cpu": "TERMINAL_CONTAINER_CPU",
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
@@ -507,7 +510,18 @@ def _get_available_skills() -> Dict[str, List[str]]:
     return skills_by_category
 
 
-def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dict] = None, enabled_toolsets: List[str] = None, session_id: str = None):
+def _format_context_length(tokens: int) -> str:
+    """Format a token count for display (e.g. 128000 → '128K', 1048576 → '1M')."""
+    if tokens >= 1_000_000:
+        val = tokens / 1_000_000
+        return f"{val:g}M"
+    elif tokens >= 1_000:
+        val = tokens / 1_000
+        return f"{val:g}K"
+    return str(tokens)
+
+
+def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dict] = None, enabled_toolsets: List[str] = None, session_id: str = None, context_length: int = None):
     """
     Build and print a Claude Code-style welcome banner with caduceus on left and info on right.
     
@@ -518,6 +532,7 @@ def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dic
         tools: List of tool definitions
         enabled_toolsets: List of enabled toolset names
         session_id: Unique session identifier for logging
+        context_length: Model's context window size in tokens
     """
     from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
     
@@ -543,7 +558,8 @@ def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dic
     if len(model_short) > 28:
         model_short = model_short[:25] + "..."
     
-    left_lines.append(f"[#FFBF00]{model_short}[/] [dim #B8860B]·[/] [dim #B8860B]Nous Research[/]")
+    ctx_str = f" [dim #B8860B]·[/] [dim #B8860B]{_format_context_length(context_length)} context[/]" if context_length else ""
+    left_lines.append(f"[#FFBF00]{model_short}[/]{ctx_str} [dim #B8860B]·[/] [dim #B8860B]Nous Research[/]")
     left_lines.append(f"[dim #B8860B]{cwd}[/]")
     
     # Add session ID if provided
@@ -690,6 +706,7 @@ COMMANDS = {
     "/cron": "Manage scheduled tasks (list, add, remove)",
     "/skills": "Search, install, inspect, or manage skills from online registries",
     "/platforms": "Show gateway/messaging platform status",
+    "/paste": "Check clipboard for an image and attach it",
     "/reload-mcp": "Reload MCP servers from config.yaml",
     "/quit": "Exit the CLI (also: /exit, /q)",
 }
@@ -1078,6 +1095,11 @@ class HermesCLI:
             # Get terminal working directory (where commands will execute)
             cwd = os.getenv("TERMINAL_CWD", os.getcwd())
             
+            # Get context length for display
+            ctx_len = None
+            if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
+                ctx_len = self.agent.context_compressor.context_length
+            
             # Build and display the banner
             build_welcome_banner(
                 console=self.console,
@@ -1086,6 +1108,7 @@ class HermesCLI:
                 tools=tools,
                 enabled_toolsets=self.enabled_toolsets,
                 session_id=self.session_id,
+                context_length=ctx_len,
             )
         
         # Show tool availability warnings if any tools are disabled
@@ -1093,6 +1116,69 @@ class HermesCLI:
         
         self.console.print()
     
+    def _try_attach_clipboard_image(self) -> bool:
+        """Check clipboard for an image and attach it if found.
+
+        Saves the image to ~/.hermes/images/ and appends the path to
+        ``_attached_images``.  Returns True if an image was attached.
+        """
+        from hermes_cli.clipboard import save_clipboard_image
+
+        img_dir = Path.home() / ".hermes" / "images"
+        self._image_counter += 1
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        img_path = img_dir / f"clip_{ts}_{self._image_counter}.png"
+
+        if save_clipboard_image(img_path):
+            self._attached_images.append(img_path)
+            return True
+        self._image_counter -= 1
+        return False
+
+    def _handle_paste_command(self):
+        """Handle /paste — explicitly check clipboard for an image.
+
+        This is the reliable fallback for terminals where BracketedPaste
+        doesn't fire for image-only clipboard content (e.g., VSCode terminal,
+        Windows Terminal with WSL2).
+        """
+        from hermes_cli.clipboard import has_clipboard_image
+        if has_clipboard_image():
+            if self._try_attach_clipboard_image():
+                n = len(self._attached_images)
+                _cprint(f"  📎 Image #{n} attached from clipboard")
+            else:
+                _cprint(f"  {_DIM}(>_<) Clipboard has an image but extraction failed{_RST}")
+        else:
+            _cprint(f"  {_DIM}(._.) No image found in clipboard{_RST}")
+
+    def _build_multimodal_content(self, text: str, images: list) -> list:
+        """Convert text + image paths into OpenAI vision multimodal content.
+
+        Returns a list of content parts suitable for the ``content`` field
+        of a ``user`` message.
+        """
+        import base64 as _b64
+
+        content_parts = []
+        text_part = text if isinstance(text, str) and text else "What do you see in this image?"
+        content_parts.append({"type": "text", "text": text_part})
+
+        _MIME = {
+            "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "gif": "image/gif", "webp": "image/webp",
+        }
+        for img_path in images:
+            if img_path.exists():
+                data = _b64.b64encode(img_path.read_bytes()).decode()
+                ext = img_path.suffix.lower().lstrip(".")
+                mime = _MIME.get(ext, "image/png")
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{data}"}
+                })
+        return content_parts
+
     def _show_tool_availability_warnings(self):
         """Show warnings about disabled tools due to missing API keys."""
         try:
@@ -1162,7 +1248,8 @@ class HermesCLI:
                 _cprint(f"  {_GOLD}{cmd:<22}{_RST} {_DIM}-{_RST} {info['description']}")
 
         _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
-        _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}\n")
+        _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}")
+        _cprint(f"  {_DIM}Paste image: Alt+V (or /paste){_RST}\n")
     
     def show_tools(self):
         """Display available tools with kawaii ASCII art."""
@@ -1771,6 +1858,8 @@ class HermesCLI:
             self._manual_compress()
         elif cmd_lower == "/usage":
             self._show_usage()
+        elif cmd_lower == "/paste":
+            self._handle_paste_command()
         elif cmd_lower == "/reload-mcp":
             self._reload_mcp()
         else:
@@ -2115,12 +2204,12 @@ class HermesCLI:
         self._approval_state = None
         self._approval_deadline = 0
         self._invalidate()
-        _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
-        return "deny"
-
-    def chat(self, message: str) -> Optional[str]:
+    def chat(self, message, images: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
+        
+        Handles streaming output, interrupt detection (user typing while agent
+        is working), and re-queueing of interrupted messages.
         
         Uses a dedicated _interrupt_queue (separate from _pending_input) to avoid
         race conditions between the process_loop and interrupt monitoring. Messages
@@ -2128,7 +2217,8 @@ class HermesCLI:
         idle go to _pending_input.
         
         Args:
-            message: The user's message
+            message: The user's message (str or multimodal content list)
+            images: Optional list of Path objects for attached images
             
         Returns:
             The agent's response, or None on error
@@ -2141,10 +2231,19 @@ class HermesCLI:
         if not self._init_agent():
             return None
         
+        # Convert attached images to OpenAI vision multimodal content
+        if images:
+            message = self._build_multimodal_content(
+                message if isinstance(message, str) else "", images
+            )
+            for img_path in images:
+                if img_path.exists():
+                    _cprint(f"  {_DIM}📎 attached {img_path.name} ({img_path.stat().st_size // 1024}KB){_RST}")
+
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": message})
         
-        w = self.console.width
+        w = shutil.get_terminal_size().columns
         _cprint(f"{_GOLD}{'─' * w}{_RST}")
         print(flush=True)
         
@@ -2157,6 +2256,7 @@ class HermesCLI:
                 result = self.agent.run_conversation(
                     user_message=message,
                     conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
+                    task_id=self.session_id,
                 )
             
             # Start agent in background thread
@@ -2219,7 +2319,7 @@ class HermesCLI:
                     response = response + "\n\n---\n_[Interrupted - processing new message]_"
             
             if response:
-                w = self.console.width
+                w = shutil.get_terminal_size().columns
                 label = " ⚕ Hermes "
                 fill = w - 2 - len(label)  # 2 for ╭ and ╮
                 top = f"{_GOLD}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}"
@@ -2304,6 +2404,10 @@ class HermesCLI:
         self._approval_state = None     # dict with command, description, choices, selected, response_queue
         self._approval_deadline = 0
 
+        # Clipboard image attachments (paste images into the CLI)
+        self._attached_images: list[Path] = []
+        self._image_counter = 0
+
         # Register callbacks so terminal_tool prompts route through our UI
         set_sudo_password_callback(self._sudo_password_callback)
         set_approval_callback(self._approval_callback)
@@ -2373,12 +2477,19 @@ class HermesCLI:
 
             # --- Normal input routing ---
             text = event.app.current_buffer.text.strip()
-            if text:
-                if self._agent_running and not text.startswith("/"):
-                    self._interrupt_queue.put(text)
+            has_images = bool(self._attached_images)
+            if text or has_images:
+                # Snapshot and clear attached images
+                images = list(self._attached_images)
+                self._attached_images.clear()
+                event.app.invalidate()
+                # Bundle text + images as a tuple when images are present
+                payload = (text, images) if images else text
+                if self._agent_running and not (text and text.startswith("/")):
+                    self._interrupt_queue.put(payload)
                 else:
-                    self._pending_input.put(text)
-                event.app.current_buffer.reset()
+                    self._pending_input.put(payload)
+                event.app.current_buffer.reset(append_to_history=True)
         
         @kb.add('escape', 'enter')
         def handle_alt_enter(event):
@@ -2422,6 +2533,24 @@ class HermesCLI:
                 max_idx = len(self._approval_state["choices"]) - 1
                 self._approval_state["selected"] = min(max_idx, self._approval_state["selected"] + 1)
                 event.app.invalidate()
+
+        # --- History navigation: up/down browse history in normal input mode ---
+        # The TextArea is multiline, so by default up/down only move the cursor.
+        # Buffer.auto_up/auto_down handle both: cursor movement when multi-line,
+        # history browsing when on the first/last line (or single-line input).
+        _normal_input = Condition(
+            lambda: not self._clarify_state and not self._approval_state and not self._sudo_state
+        )
+
+        @kb.add('up', filter=_normal_input)
+        def history_up(event):
+            """Up arrow: browse history when on first line, else move cursor up."""
+            event.app.current_buffer.auto_up(count=event.arg)
+
+        @kb.add('down', filter=_normal_input)
+        def history_down(event):
+            """Down arrow: browse history when on last line, else move cursor down."""
+            event.app.current_buffer.auto_down(count=event.arg)
 
         @kb.add('c-c')
         def handle_ctrl_c(event):
@@ -2472,15 +2601,68 @@ class HermesCLI:
                 print("\n⚡ Interrupting agent... (press Ctrl+C again to force exit)")
                 self.agent.interrupt()
             else:
-                self._should_exit = True
-                event.app.exit()
+                # If there's text or images, clear them (like bash).
+                # If everything is already empty, exit.
+                if event.app.current_buffer.text or self._attached_images:
+                    event.app.current_buffer.reset()
+                    self._attached_images.clear()
+                    event.app.invalidate()
+                else:
+                    self._should_exit = True
+                    event.app.exit()
         
         @kb.add('c-d')
         def handle_ctrl_d(event):
             """Handle Ctrl+D - exit."""
             self._should_exit = True
             event.app.exit()
-        
+
+        from prompt_toolkit.keys import Keys
+
+        @kb.add(Keys.BracketedPaste, eager=True)
+        def handle_paste(event):
+            """Handle terminal paste — detect clipboard images.
+
+            When the terminal supports bracketed paste, Ctrl+V / Cmd+V
+            triggers this with the pasted text.  We also check the
+            clipboard for an image on every paste event.
+            """
+            pasted_text = event.data or ""
+            if self._try_attach_clipboard_image():
+                event.app.invalidate()
+            if pasted_text:
+                event.current_buffer.insert_text(pasted_text)
+
+        @kb.add('c-v')
+        def handle_ctrl_v(event):
+            """Fallback image paste for terminals without bracketed paste.
+
+            On Linux terminals (GNOME Terminal, Konsole, etc.), Ctrl+V
+            sends raw byte 0x16 instead of triggering a paste.  This
+            binding catches that and checks the clipboard for images.
+            On terminals that DO intercept Ctrl+V for paste (macOS
+            Terminal, iTerm2, VSCode, Windows Terminal), the bracketed
+            paste handler fires instead and this binding never triggers.
+            """
+            if self._try_attach_clipboard_image():
+                event.app.invalidate()
+
+        @kb.add('escape', 'v')
+        def handle_alt_v(event):
+            """Alt+V — paste image from clipboard.
+
+            Alt key combos pass through all terminal emulators (sent as
+            ESC + key), unlike Ctrl+V which terminals intercept for text
+            paste.  This is the reliable way to attach clipboard images
+            on WSL2, VSCode, and any terminal over SSH where Ctrl+V
+            can't reach the application for image-only clipboard.
+            """
+            if self._try_attach_clipboard_image():
+                event.app.invalidate()
+            else:
+                # No image found — show a hint
+                pass  # silent when no image (avoid noise on accidental press)
+
         # Dynamic prompt: shows Hermes symbol when agent is working,
         # or answer prompt when clarify freetext mode is active.
         cli_ref = self
@@ -2516,7 +2698,7 @@ class HermesCLI:
         def _input_height():
             try:
                 doc = input_area.buffer.document
-                available_width = (cli_ref.console.width or 80) - 4  # subtract prompt width
+                available_width = shutil.get_terminal_size().columns - 4  # subtract prompt width
                 if available_width < 10:
                     available_width = 40
                 visual_lines = 0
@@ -2777,13 +2959,35 @@ class HermesCLI:
 
         # Horizontal rules above and below the input (bronze, 1 line each).
         # The bottom rule moves down as the TextArea grows with newlines.
+        # Using char='─' instead of hardcoded repetition so the rule
+        # always spans the full terminal width on any screen size.
         input_rule_top = Window(
-            content=FormattedTextControl([('class:input-rule', '─' * 200)]),
+            char='─',
             height=1,
+            style='class:input-rule',
         )
         input_rule_bot = Window(
-            content=FormattedTextControl([('class:input-rule', '─' * 200)]),
+            char='─',
             height=1,
+            style='class:input-rule',
+        )
+
+        # Image attachment indicator — shows badges like [📎 Image #1] above input
+        cli_ref = self
+
+        def _get_image_bar():
+            if not cli_ref._attached_images:
+                return []
+            base = cli_ref._image_counter - len(cli_ref._attached_images) + 1
+            badges = " ".join(
+                f"[📎 Image #{base + i}]"
+                for i in range(len(cli_ref._attached_images))
+            )
+            return [("class:image-badge", f" {badges} ")]
+
+        image_bar = Window(
+            content=FormattedTextControl(_get_image_bar),
+            height=Condition(lambda: bool(cli_ref._attached_images)),
         )
 
         # Layout: interactive prompt widgets + ruled input at bottom.
@@ -2797,6 +3001,7 @@ class HermesCLI:
                 clarify_widget,
                 spacer,
                 input_rule_top,
+                image_bar,
                 input_area,
                 input_rule_bot,
                 CompletionsMenu(max_height=12, scroll_offset=1),
@@ -2812,6 +3017,8 @@ class HermesCLI:
             'hint': '#555555 italic',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
+            # Clipboard image attachment badges
+            'image-badge': '#87CEEB bold',
             'completion-menu': 'bg:#1a1a2e #FFF8DC',
             'completion-menu.completion': 'bg:#1a1a2e #FFF8DC',
             'completion-menu.completion.current': 'bg:#333355 #FFD700',
@@ -2861,9 +3068,14 @@ class HermesCLI:
                     
                     if not user_input:
                         continue
+
+                    # Unpack image payload: (text, [Path, ...]) or plain str
+                    submit_images = []
+                    if isinstance(user_input, tuple):
+                        user_input, submit_images = user_input
                     
                     # Check for commands
-                    if user_input.startswith("/"):
+                    if isinstance(user_input, str) and user_input.startswith("/"):
                         print(f"\n⚙️  {user_input}")
                         if not self.process_command(user_input):
                             self._should_exit = True
@@ -2874,7 +3086,7 @@ class HermesCLI:
                     
                     # Expand paste references back to full content
                     import re as _re
-                    paste_match = _re.match(r'\[Pasted text #\d+: \d+ lines → (.+)\]', user_input)
+                    paste_match = _re.match(r'\[Pasted text #\d+: \d+ lines → (.+)\]', user_input) if isinstance(user_input, str) else None
                     if paste_match:
                         paste_path = Path(paste_match.group(1))
                         if paste_path.exists():
@@ -2896,12 +3108,17 @@ class HermesCLI:
                             print()
                             _cprint(f"{_GOLD}●{_RST} {_BOLD}{user_input}{_RST}")
                     
+                    # Show image attachment count
+                    if submit_images:
+                        n = len(submit_images)
+                        _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
+
                     # Regular chat - run agent
                     self._agent_running = True
                     app.invalidate()  # Refresh status line
                     
                     try:
-                        self.chat(user_input)
+                        self.chat(user_input, images=submit_images or None)
                     finally:
                         self._agent_running = False
                         app.invalidate()  # Refresh status line

@@ -72,15 +72,27 @@ def prompt(question: str, default: str = None, password: bool = False) -> str:
         sys.exit(1)
 
 def prompt_choice(question: str, choices: list, default: int = 0) -> int:
-    """Prompt for a choice from a list with arrow key navigation."""
+    """Prompt for a choice from a list with arrow key navigation.
+    
+    Escape keeps the current default (skips the question).
+    Ctrl+C exits the wizard.
+    """
     print(color(question, Colors.YELLOW))
     
     # Try to use interactive menu if available
     try:
         from simple_term_menu import TerminalMenu
+        import re
         
-        # Add visual indicators
-        menu_choices = [f"  {choice}" for choice in choices]
+        # Strip emoji characters — simple_term_menu miscalculates visual
+        # width of emojis, causing duplicated/garbled lines on redraw.
+        _emoji_re = re.compile(
+            "[\U0001f300-\U0001f9ff\U00002600-\U000027bf\U0000fe00-\U0000fe0f"
+            "\U0001fa00-\U0001fa6f\U0001fa70-\U0001faff\u200d]+", flags=re.UNICODE
+        )
+        menu_choices = [f"  {_emoji_re.sub('', choice).strip()}" for choice in choices]
+        
+        print_info("  ↑/↓ Navigate  Enter Select  Esc Skip  Ctrl+C Exit")
         
         terminal_menu = TerminalMenu(
             menu_choices,
@@ -93,42 +105,53 @@ def prompt_choice(question: str, choices: list, default: int = 0) -> int:
         )
         
         idx = terminal_menu.show()
-        if idx is None:  # User pressed Escape or Ctrl+C
+        if idx is None:  # User pressed Escape — keep current value
+            print_info(f"  Skipped (keeping current)")
             print()
-            sys.exit(1)
+            return default
         print()  # Add newline after selection
         return idx
         
     except (ImportError, NotImplementedError):
-        # Fallback to number-based selection (simple_term_menu doesn't support Windows)
-        for i, choice in enumerate(choices):
-            marker = "●" if i == default else "○"
-            if i == default:
-                print(color(f"  {marker} {choice}", Colors.GREEN))
-            else:
-                print(f"  {marker} {choice}")
-        
-        while True:
-            try:
-                value = input(color(f"  Select [1-{len(choices)}] ({default + 1}): ", Colors.DIM))
-                if not value:
-                    return default
-                idx = int(value) - 1
-                if 0 <= idx < len(choices):
-                    return idx
-                print_error(f"Please enter a number between 1 and {len(choices)}")
-            except ValueError:
-                print_error("Please enter a number")
-            except (KeyboardInterrupt, EOFError):
-                print()
-                sys.exit(1)
+        pass
+    except Exception as e:
+        print(f"  (Interactive menu unavailable: {e})")
+
+    # Fallback to number-based selection (simple_term_menu doesn't support Windows)
+    for i, choice in enumerate(choices):
+        marker = "●" if i == default else "○"
+        if i == default:
+            print(color(f"  {marker} {choice}", Colors.GREEN))
+        else:
+            print(f"  {marker} {choice}")
+
+    print_info(f"  Enter for default ({default + 1})  Ctrl+C to exit")
+
+    while True:
+        try:
+            value = input(color(f"  Select [1-{len(choices)}] ({default + 1}): ", Colors.DIM))
+            if not value:
+                return default
+            idx = int(value) - 1
+            if 0 <= idx < len(choices):
+                return idx
+            print_error(f"Please enter a number between 1 and {len(choices)}")
+        except ValueError:
+            print_error("Please enter a number")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(1)
 
 def prompt_yes_no(question: str, default: bool = True) -> bool:
-    """Prompt for yes/no."""
+    """Prompt for yes/no. Ctrl+C exits, empty input returns default."""
     default_str = "Y/n" if default else "y/N"
     
     while True:
-        value = input(color(f"{question} [{default_str}]: ", Colors.YELLOW)).strip().lower()
+        try:
+            value = input(color(f"{question} [{default_str}]: ", Colors.YELLOW)).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(1)
         
         if not value:
             return default
@@ -158,7 +181,7 @@ def prompt_checklist(title: str, items: list, pre_selected: list = None) -> list
         pre_selected = []
     
     print(color(title, Colors.YELLOW))
-    print_info("SPACE to toggle, ENTER to confirm.")
+    print_info("  SPACE Toggle  ENTER Confirm  ESC Skip  Ctrl+C Exit")
     print()
     
     try:
@@ -194,7 +217,8 @@ def prompt_checklist(title: str, items: list, pre_selected: list = None) -> list
         terminal_menu.show()
         
         if terminal_menu.chosen_menu_entries is None:
-            return []
+            print_info("  Skipped (keeping current)")
+            return list(pre_selected)
         
         selected = list(terminal_menu.chosen_menu_indices or [])
         return selected
@@ -383,6 +407,46 @@ def _print_setup_summary(config: dict, hermes_home):
     print()
 
 
+def _prompt_container_resources(config: dict):
+    """Prompt for container resource settings (Docker, Singularity, Modal, Daytona)."""
+    terminal = config.setdefault('terminal', {})
+
+    print()
+    print_info("Container Resource Settings:")
+
+    # Persistence
+    current_persist = terminal.get('container_persistent', True)
+    persist_label = "yes" if current_persist else "no"
+    print_info(f"  Persistent filesystem keeps files between sessions.")
+    print_info(f"  Set to 'no' for ephemeral sandboxes that reset each time.")
+    persist_str = prompt(f"  Persist filesystem across sessions? (yes/no)", persist_label)
+    terminal['container_persistent'] = persist_str.lower() in ('yes', 'true', 'y', '1')
+
+    # CPU
+    current_cpu = terminal.get('container_cpu', 1)
+    cpu_str = prompt(f"  CPU cores", str(current_cpu))
+    try:
+        terminal['container_cpu'] = float(cpu_str)
+    except ValueError:
+        pass
+
+    # Memory
+    current_mem = terminal.get('container_memory', 5120)
+    mem_str = prompt(f"  Memory in MB (5120 = 5GB)", str(current_mem))
+    try:
+        terminal['container_memory'] = int(mem_str)
+    except ValueError:
+        pass
+
+    # Disk
+    current_disk = terminal.get('container_disk', 51200)
+    disk_str = prompt(f"  Disk in MB (51200 = 50GB)", str(current_disk))
+    try:
+        terminal['container_disk'] = int(disk_str)
+    except ValueError:
+        pass
+
+
 def run_setup_wizard(args):
     """Run the interactive setup wizard."""
     ensure_hermes_home()
@@ -395,11 +459,14 @@ def run_setup_wizard(args):
     # a template, so it always exists after install. We need an actual
     # inference provider to consider it "existing" (otherwise quick mode
     # would skip provider selection, leaving hermes non-functional).
+    # NOTE: Use bool() not `is not None` — the .env template has empty
+    # values (e.g. OPENROUTER_API_KEY=) that load_dotenv sets to "", which
+    # passes `is not None` but isn't a real configured provider.
     from hermes_cli.auth import get_active_provider
     active_provider = get_active_provider()
     is_existing = (
-        get_env_value("OPENROUTER_API_KEY") is not None
-        or get_env_value("OPENAI_BASE_URL") is not None
+        bool(get_env_value("OPENROUTER_API_KEY"))
+        or bool(get_env_value("OPENAI_BASE_URL"))
         or active_provider is not None
     )
     
@@ -927,19 +994,20 @@ def run_setup_wizard(args):
     
     terminal_choices.extend([
         "Modal (cloud execution, GPU access, serverless)",
+        "Daytona (cloud sandboxes, persistent workspaces)",
         "SSH (run commands on a remote server)",
         f"Keep current ({current_backend})"
     ])
     
     # Build index map based on available choices
     if is_linux:
-        backend_to_idx = {'local': 0, 'docker': 1, 'singularity': 2, 'modal': 3, 'ssh': 4}
-        idx_to_backend = {0: 'local', 1: 'docker', 2: 'singularity', 3: 'modal', 4: 'ssh'}
-        keep_current_idx = 5
+        backend_to_idx = {'local': 0, 'docker': 1, 'singularity': 2, 'modal': 3, 'daytona': 4, 'ssh': 5}
+        idx_to_backend = {0: 'local', 1: 'docker', 2: 'singularity', 3: 'modal', 4: 'daytona', 5: 'ssh'}
+        keep_current_idx = 6
     else:
-        backend_to_idx = {'local': 0, 'docker': 1, 'modal': 2, 'ssh': 3}
-        idx_to_backend = {0: 'local', 1: 'docker', 2: 'modal', 3: 'ssh'}
-        keep_current_idx = 4
+        backend_to_idx = {'local': 0, 'docker': 1, 'modal': 2, 'daytona': 3, 'ssh': 4}
+        idx_to_backend = {0: 'local', 1: 'docker', 2: 'modal', 3: 'daytona', 4: 'ssh'}
+        keep_current_idx = 5
         if current_backend == 'singularity':
             print_warning("Singularity is only available on Linux - please select a different backend")
     
@@ -951,6 +1019,42 @@ def run_setup_wizard(args):
     # Map index to backend name (handles platform differences)
     selected_backend = idx_to_backend.get(terminal_idx)
     
+    # Validate that required binaries exist for the chosen backend
+    import shutil as _shutil
+    _backend_bins = {
+        'docker': ('docker', [
+            "Docker is not installed on this machine.",
+            "Install Docker Desktop: https://www.docker.com/products/docker-desktop/",
+            "On Linux: curl -fsSL https://get.docker.com | sh",
+        ]),
+        'singularity': (None, []),  # check both names
+        'ssh': ('ssh', [
+            "SSH client not found.",
+            "On Linux: sudo apt install openssh-client",
+            "On macOS: SSH should be pre-installed.",
+        ]),
+    }
+    if selected_backend == 'docker':
+        if not _shutil.which('docker'):
+            print()
+            print_warning("Docker is not installed on this machine.")
+            print_info("  Install Docker Desktop: https://www.docker.com/products/docker-desktop/")
+            print_info("  On Linux: curl -fsSL https://get.docker.com | sh")
+            print()
+            if not prompt_yes_no("  Proceed with Docker anyway? (you can install it later)", False):
+                print_info("  Falling back to local backend.")
+                selected_backend = 'local'
+    elif selected_backend == 'singularity':
+        if not _shutil.which('apptainer') and not _shutil.which('singularity'):
+            print()
+            print_warning("Neither apptainer nor singularity is installed on this machine.")
+            print_info("  Apptainer: https://apptainer.org/docs/admin/main/installation.html")
+            print_info("  This is typically only available on HPC/Linux systems.")
+            print()
+            if not prompt_yes_no("  Proceed with Singularity anyway? (you can install it later)", False):
+                print_info("  Falling back to local backend.")
+                selected_backend = 'local'
+
     if selected_backend == 'local':
         config.setdefault('terminal', {})['backend'] = 'local'
         print_info("Local Execution Configuration:")
@@ -976,6 +1080,10 @@ def run_setup_wizard(args):
             cwd_expanded = cwd_input
         save_env_value("MESSAGING_CWD", cwd_expanded)
         
+        print()
+        print_info("Note: Container resource settings (CPU, memory, disk, persistence)")
+        print_info("are in your config but only apply to Docker/Singularity/Modal/Daytona backends.")
+
         if prompt_yes_no("  Enable sudo support? (allows agent to run sudo commands)", False):
             print_warning("  SECURITY WARNING: Sudo password will be stored in plaintext")
             sudo_pass = prompt("  Sudo password (leave empty to skip)", password=True)
@@ -995,6 +1103,7 @@ def run_setup_wizard(args):
             print_info("Requires Docker Desktop for Windows")
         docker_image = prompt("  Docker image", default_docker)
         config['terminal']['docker_image'] = docker_image
+        _prompt_container_resources(config)
         print_success("Terminal set to Docker")
     
     elif selected_backend == 'singularity':
@@ -1004,6 +1113,7 @@ def run_setup_wizard(args):
         print_info("Requires apptainer or singularity to be installed")
         singularity_image = prompt("  Image (docker:// prefix for Docker Hub)", default_singularity)
         config['terminal']['singularity_image'] = singularity_image
+        _prompt_container_resources(config)
         print_success("Terminal set to Singularity/Apptainer")
     
     elif selected_backend == 'modal':
@@ -1054,8 +1164,54 @@ def run_setup_wizard(args):
         if token_secret:
             save_env_value("MODAL_TOKEN_SECRET", token_secret)
         
+        _prompt_container_resources(config)
         print_success("Terminal set to Modal")
-    
+
+    elif selected_backend == 'daytona':
+        config.setdefault('terminal', {})['backend'] = 'daytona'
+        default_daytona = config.get('terminal', {}).get('daytona_image', 'nikolaik/python-nodejs:python3.11-nodejs20')
+        print_info("Daytona Cloud Configuration:")
+        print_info("Get your API key at: https://app.daytona.io/dashboard/keys")
+
+        # Check if daytona SDK is installed
+        try:
+            from daytona import Daytona
+            print_info("daytona SDK: installed ✓")
+        except ImportError:
+            print_info("Installing required package: daytona...")
+            import subprocess
+            import shutil
+            uv_bin = shutil.which("uv")
+            if uv_bin:
+                result = subprocess.run(
+                    [uv_bin, "pip", "install", "daytona"],
+                    capture_output=True, text=True
+                )
+            else:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "daytona"],
+                    capture_output=True, text=True
+                )
+            if result.returncode == 0:
+                print_success("daytona SDK installed")
+            else:
+                print_warning("Failed to install daytona SDK — install manually:")
+                print_info('  pip install daytona')
+
+        daytona_image = prompt("  Container image", default_daytona)
+        config['terminal']['daytona_image'] = daytona_image
+
+        current_key = get_env_value('DAYTONA_API_KEY')
+        if current_key:
+            print_info(f"  API Key: {current_key[:8]}... (configured)")
+
+        api_key = prompt("  Daytona API key", current_key or "", password=True)
+        if api_key:
+            save_env_value("DAYTONA_API_KEY", api_key)
+
+        _prompt_container_resources(config)
+        print_success("Terminal set to Daytona")
+
     elif selected_backend == 'ssh':
         config.setdefault('terminal', {})['backend'] = 'ssh'
         print_info("SSH Remote Execution Configuration:")
@@ -1083,6 +1239,9 @@ def run_setup_wizard(args):
         if ssh_key:
             save_env_value("TERMINAL_SSH_KEY", ssh_key)
         
+        print()
+        print_info("Note: Container resource settings (CPU, memory, disk, persistence)")
+        print_info("are in your config but only apply to Docker/Singularity/Modal/Daytona backends.")
         print_success("Terminal set to SSH")
     # else: Keep current (selected_backend is None)
     
@@ -1093,6 +1252,9 @@ def run_setup_wizard(args):
         docker_image = config.get('terminal', {}).get('docker_image')
         if docker_image:
             save_env_value("TERMINAL_DOCKER_IMAGE", docker_image)
+        daytona_image = config.get('terminal', {}).get('daytona_image')
+        if daytona_image:
+            save_env_value("TERMINAL_DAYTONA_IMAGE", daytona_image)
     
     # =========================================================================
     # Step 5: Agent Settings
@@ -1396,7 +1558,7 @@ def run_setup_wizard(args):
             print_info("Run 'hermes whatsapp' to choose your mode (separate bot number")
             print_info("or personal self-chat) and pair via QR code.")
     
-    # Gateway reminder
+    # Gateway service setup
     any_messaging = (
         get_env_value('TELEGRAM_BOT_TOKEN')
         or get_env_value('DISCORD_BOT_TOKEN')
@@ -1407,10 +1569,7 @@ def run_setup_wizard(args):
         print()
         print_info("━" * 50)
         print_success("Messaging platforms configured!")
-        print_info("Start the gateway after setup to bring your bots online:")
-        print_info("   hermes gateway              # Run in foreground")
-        print_info("   hermes gateway install      # Install as background service (Linux)")
-        
+
         # Check if any home channels are missing
         missing_home = []
         if get_env_value('TELEGRAM_BOT_TOKEN') and not get_env_value('TELEGRAM_HOME_CHANNEL'):
@@ -1419,16 +1578,76 @@ def run_setup_wizard(args):
             missing_home.append("Discord")
         if get_env_value('SLACK_BOT_TOKEN') and not get_env_value('SLACK_HOME_CHANNEL'):
             missing_home.append("Slack")
-        
+
         if missing_home:
             print()
-            print_info(f"⚠️  No home channel set for: {', '.join(missing_home)}")
+            print_warning(f"No home channel set for: {', '.join(missing_home)}")
             print_info("   Without a home channel, cron jobs and cross-platform")
             print_info("   messages can't be delivered to those platforms.")
             print_info("   Set one later with /set-home in your chat, or:")
             for plat in missing_home:
                 print_info(f"     hermes config set {plat.upper()}_HOME_CHANNEL <channel_id>")
-        
+
+        # Offer to install the gateway as a system service
+        import platform as _platform
+        _is_linux = _platform.system() == "Linux"
+        _is_macos = _platform.system() == "Darwin"
+
+        from hermes_cli.gateway import (
+            _is_service_installed, _is_service_running,
+            systemd_install, systemd_start, systemd_restart,
+            launchd_install, launchd_start, launchd_restart,
+        )
+
+        service_installed = _is_service_installed()
+        service_running = _is_service_running()
+
+        print()
+        if service_running:
+            if prompt_yes_no("  Restart the gateway to pick up changes?", True):
+                try:
+                    if _is_linux:
+                        systemd_restart()
+                    elif _is_macos:
+                        launchd_restart()
+                except Exception as e:
+                    print_error(f"  Restart failed: {e}")
+        elif service_installed:
+            if prompt_yes_no("  Start the gateway service?", True):
+                try:
+                    if _is_linux:
+                        systemd_start()
+                    elif _is_macos:
+                        launchd_start()
+                except Exception as e:
+                    print_error(f"  Start failed: {e}")
+        elif _is_linux or _is_macos:
+            svc_name = "systemd" if _is_linux else "launchd"
+            if prompt_yes_no(f"  Install the gateway as a {svc_name} service? (runs in background, starts on boot)", True):
+                try:
+                    if _is_linux:
+                        systemd_install(force=False)
+                    else:
+                        launchd_install(force=False)
+                    print()
+                    if prompt_yes_no("  Start the service now?", True):
+                        try:
+                            if _is_linux:
+                                systemd_start()
+                            elif _is_macos:
+                                launchd_start()
+                        except Exception as e:
+                            print_error(f"  Start failed: {e}")
+                except Exception as e:
+                    print_error(f"  Install failed: {e}")
+                    print_info("  You can try manually: hermes gateway install")
+            else:
+                print_info("  You can install later: hermes gateway install")
+                print_info("  Or run in foreground:  hermes gateway")
+        else:
+            print_info("Start the gateway to bring your bots online:")
+            print_info("   hermes gateway              # Run in foreground")
+
         print_info("━" * 50)
     
     # =========================================================================

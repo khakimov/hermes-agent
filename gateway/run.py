@@ -66,6 +66,7 @@ if _config_path.exists():
                 "docker_image": "TERMINAL_DOCKER_IMAGE",
                 "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
                 "modal_image": "TERMINAL_MODAL_IMAGE",
+                "daytona_image": "TERMINAL_DAYTONA_IMAGE",
                 "ssh_host": "TERMINAL_SSH_HOST",
                 "ssh_user": "TERMINAL_SSH_USER",
                 "ssh_port": "TERMINAL_SSH_PORT",
@@ -118,6 +119,7 @@ from gateway.session import (
     SessionContext,
     build_session_context,
     build_session_context_prompt,
+    build_session_key,
 )
 from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
@@ -462,6 +464,9 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Channel directory build failed: %s", e)
         
+        # Check if we're restarting after a /update command
+        await self._send_update_notification()
+
         logger.info("Press Ctrl+C to stop")
         
         return True
@@ -645,11 +650,7 @@ class GatewayRunner:
         # PRIORITY: If an agent is already running for this session, interrupt it
         # immediately. This is before command parsing to minimize latency -- the
         # user's "stop" message reaches the agent as fast as possible.
-        _quick_key = (
-            f"agent:main:{source.platform.value}:{source.chat_type}:{source.chat_id}"
-            if source.chat_type != "dm"
-            else f"agent:main:{source.platform.value}:dm"
-        )
+        _quick_key = build_session_key(source)
         if _quick_key in self._running_agents:
             running_agent = self._running_agents[_quick_key]
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
@@ -666,7 +667,7 @@ class GatewayRunner:
         # Emit command:* hook for any recognized slash command
         _known_commands = {"new", "reset", "help", "status", "stop", "model",
                           "personality", "retry", "undo", "sethome", "set-home",
-                          "compress", "usage", "reload-mcp"}
+                          "compress", "usage", "reload-mcp", "update"}
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
                 "platform": source.platform.value if source.platform else "",
@@ -710,6 +711,9 @@ class GatewayRunner:
 
         if command == "reload-mcp":
             return await self._handle_reload_mcp_command(event)
+
+        if command == "update":
+            return await self._handle_update_command(event)
         
         # Skill slash commands: /skill-name loads the skill and sends to agent
         if command:
@@ -727,12 +731,7 @@ class GatewayRunner:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
         
         # Check for pending exec approval responses
-        if source.chat_type != "dm":
-            session_key_preview = f"agent:main:{source.platform.value}:{source.chat_type}:{source.chat_id}"
-        elif source.platform and source.platform.value == "whatsapp" and source.chat_id:
-            session_key_preview = f"agent:main:{source.platform.value}:dm:{source.chat_id}"
-        else:
-            session_key_preview = f"agent:main:{source.platform.value}:dm"
+        session_key_preview = build_session_key(source)
         if session_key_preview in self._pending_approvals:
             user_text = event.text.strip().lower()
             if user_text in ("yes", "y", "approve", "ok", "go", "do it"):
@@ -961,9 +960,12 @@ class GatewayRunner:
                     }
                 )
             
-            # Find only the NEW messages from this turn (skip history we loaded)
-            history_len = len(history)
-            new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else agent_messages
+            # Find only the NEW messages from this turn (skip history we loaded).
+            # Use the filtered history length (history_offset) that was actually
+            # passed to the agent, not len(history) which includes session_meta
+            # entries that were stripped before the agent saw them.
+            history_len = agent_result.get("history_offset", len(history))
+            new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
             
             # If no new messages found (edge case), fall back to simple user/assistant
             if not new_messages:
@@ -1225,6 +1227,7 @@ class GatewayRunner:
             "`/compress` — Compress conversation context",
             "`/usage` — Show token usage for this session",
             "`/reload-mcp` — Reload MCP servers from config",
+            "`/update` — Update Hermes Agent to the latest version",
             "`/help` — Show this message",
         ]
         try:
@@ -1373,8 +1376,7 @@ class GatewayRunner:
         )
         
         # Let the normal message handler process it
-        await self._handle_message(retry_event)
-        return None  # Response sent through normal flow
+        return await self._handle_message(retry_event)
     
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo command - remove the last user/assistant exchange."""
@@ -1483,8 +1485,7 @@ class GatewayRunner:
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the session's last agent run."""
         source = event.source
-        session_key = f"agent:main:{source.platform.value}:" + \
-                      (f"dm" if source.chat_type == "dm" else f"{source.chat_type}:{source.chat_id}")
+        session_key = build_session_key(source)
 
         agent = self._running_agents.get(session_key)
         if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
@@ -1587,6 +1588,111 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("MCP reload failed: %s", e)
             return f"❌ MCP reload failed: {e}"
+
+    async def _handle_update_command(self, event: MessageEvent) -> str:
+        """Handle /update command — update Hermes Agent to the latest version.
+
+        Spawns ``hermes update`` in a separate systemd scope so it survives the
+        gateway restart that ``hermes update`` triggers at the end.  A marker
+        file is written so the *new* gateway process can notify the user of the
+        result on startup.
+        """
+        import json
+        import shutil
+        import subprocess
+        from datetime import datetime
+
+        project_root = Path(__file__).parent.parent.resolve()
+        git_dir = project_root / '.git'
+
+        if not git_dir.exists():
+            return "✗ Not a git repository — cannot update."
+
+        hermes_bin = shutil.which("hermes")
+        if not hermes_bin:
+            return "✗ `hermes` command not found on PATH."
+
+        # Write marker so the restarted gateway can notify this chat
+        pending_path = _hermes_home / ".update_pending.json"
+        output_path = _hermes_home / ".update_output.txt"
+        pending = {
+            "platform": event.source.platform.value,
+            "chat_id": event.source.chat_id,
+            "user_id": event.source.user_id,
+            "timestamp": datetime.now().isoformat(),
+        }
+        pending_path.write_text(json.dumps(pending))
+
+        # Spawn `hermes update` in a separate cgroup so it survives gateway
+        # restart.  systemd-run --user --scope creates a transient scope unit.
+        update_cmd = f"{hermes_bin} update > {output_path} 2>&1"
+        try:
+            systemd_run = shutil.which("systemd-run")
+            if systemd_run:
+                subprocess.Popen(
+                    [systemd_run, "--user", "--scope",
+                     "--unit=hermes-update", "--",
+                     "bash", "-c", update_cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            else:
+                # Fallback: best-effort detach with start_new_session
+                subprocess.Popen(
+                    ["bash", "-c", f"nohup {update_cmd} &"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+        except Exception as e:
+            pending_path.unlink(missing_ok=True)
+            return f"✗ Failed to start update: {e}"
+
+        return "⚕ Starting Hermes update… I'll notify you when it's done."
+
+    async def _send_update_notification(self) -> None:
+        """If the gateway is starting after a ``/update``, notify the user."""
+        import json
+        import re as _re
+
+        pending_path = _hermes_home / ".update_pending.json"
+        output_path = _hermes_home / ".update_output.txt"
+
+        if not pending_path.exists():
+            return
+
+        try:
+            pending = json.loads(pending_path.read_text())
+            platform_str = pending.get("platform")
+            chat_id = pending.get("chat_id")
+
+            # Read the captured update output
+            output = ""
+            if output_path.exists():
+                output = output_path.read_text()
+
+            # Resolve adapter
+            platform = Platform(platform_str)
+            adapter = self.adapters.get(platform)
+
+            if adapter and chat_id:
+                # Strip ANSI escape codes for clean display
+                output = _re.sub(r'\x1b\[[0-9;]*m', '', output).strip()
+                if output:
+                    # Truncate if too long for a single message
+                    if len(output) > 3500:
+                        output = "…" + output[-3500:]
+                    msg = f"✅ Hermes update finished — gateway restarted.\n\n```\n{output}\n```"
+                else:
+                    msg = "✅ Hermes update finished — gateway restarted successfully."
+                await adapter.send(chat_id, msg)
+                logger.info("Sent post-update notification to %s:%s", platform_str, chat_id)
+        except Exception as e:
+            logger.warning("Post-update notification failed: %s", e)
+        finally:
+            pending_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
 
     def _set_session_env(self, context: SessionContext) -> None:
         """Set environment variables for the current session."""
@@ -1955,32 +2061,73 @@ class GatewayRunner:
             progress_queue.put(msg)
         
         # Background task to send progress messages
+        # Accumulates tool lines into a single message that gets edited
         async def send_progress_messages():
             if not progress_queue:
                 return
-            
+
             adapter = self.adapters.get(source.platform)
             if not adapter:
                 return
-            
+
+            progress_lines = []      # Accumulated tool lines
+            progress_msg_id = None   # ID of the progress message to edit
+            can_edit = True          # False once an edit fails (platform doesn't support it)
+
             while True:
                 try:
-                    # Non-blocking check with small timeout
                     msg = progress_queue.get_nowait()
-                    await adapter.send(chat_id=source.chat_id, content=msg)
-                    # Restore typing indicator after sending progress message
+                    progress_lines.append(msg)
+
+                    if can_edit and progress_msg_id is not None:
+                        # Try to edit the existing progress message
+                        full_text = "\n".join(progress_lines)
+                        result = await adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=progress_msg_id,
+                            content=full_text,
+                        )
+                        if not result.success:
+                            # Platform doesn't support editing — stop trying,
+                            # send just this new line as a separate message
+                            can_edit = False
+                            await adapter.send(chat_id=source.chat_id, content=msg)
+                    else:
+                        if can_edit:
+                            # First tool: send all accumulated text as new message
+                            full_text = "\n".join(progress_lines)
+                            result = await adapter.send(chat_id=source.chat_id, content=full_text)
+                        else:
+                            # Editing unsupported: send just this line
+                            result = await adapter.send(chat_id=source.chat_id, content=msg)
+                        if result.success and result.message_id:
+                            progress_msg_id = result.message_id
+
+                    # Restore typing indicator
                     await asyncio.sleep(0.3)
                     await adapter.send_typing(source.chat_id)
+
                 except queue.Empty:
-                    await asyncio.sleep(0.3)  # Check again soon
+                    await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
-                    # Drain remaining messages
+                    # Drain remaining queued messages
                     while not progress_queue.empty():
                         try:
                             msg = progress_queue.get_nowait()
-                            await adapter.send(chat_id=source.chat_id, content=msg)
+                            progress_lines.append(msg)
                         except Exception:
                             break
+                    # Final edit with all remaining tools (only if editing works)
+                    if can_edit and progress_lines and progress_msg_id:
+                        full_text = "\n".join(progress_lines)
+                        try:
+                            await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=progress_msg_id,
+                                content=full_text,
+                            )
+                        except Exception:
+                            pass
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
@@ -2147,7 +2294,7 @@ class GatewayRunner:
                             if _p:
                                 _history_media_paths.add(_p)
             
-            result = agent.run_conversation(message, conversation_history=agent_history)
+            result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
             result_holder[0] = result
             
             # Return final response, or a message if something went wrong
@@ -2159,6 +2306,7 @@ class GatewayRunner:
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "tools": tools_holder[0] or [],
+                    "history_offset": len(agent_history),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -2211,6 +2359,7 @@ class GatewayRunner:
                 "tools": tools_holder[0] or [],
                 "input_tokens": _prompt_tokens,
                 "output_tokens": _completion_tokens,
+                "history_offset": len(agent_history),
             }
         
         # Start progress message sender if enabled
@@ -2372,6 +2521,27 @@ async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
     Returns True if the gateway ran successfully, False if it failed to start.
     A False return causes a non-zero exit code so systemd can auto-restart.
     """
+    # ── Duplicate-instance guard ──────────────────────────────────────
+    # Prevent two gateways from running under the same HERMES_HOME.
+    # The PID file is scoped to HERMES_HOME, so future multi-profile
+    # setups (each profile using a distinct HERMES_HOME) will naturally
+    # allow concurrent instances without tripping this guard.
+    from gateway.status import get_running_pid
+    existing_pid = get_running_pid()
+    if existing_pid is not None and existing_pid != os.getpid():
+        hermes_home = os.getenv("HERMES_HOME", "~/.hermes")
+        logger.error(
+            "Another gateway instance is already running (PID %d, HERMES_HOME=%s). "
+            "Use 'hermes gateway restart' to replace it, or 'hermes gateway stop' first.",
+            existing_pid, hermes_home,
+        )
+        print(
+            f"\n❌ Gateway already running (PID {existing_pid}).\n"
+            f"   Use 'hermes gateway restart' to replace it,\n"
+            f"   or 'hermes gateway stop' to kill it first.\n"
+        )
+        return False
+
     # Configure rotating file log so gateway output is persisted for debugging
     log_dir = _hermes_home / 'logs'
     log_dir.mkdir(parents=True, exist_ok=True)

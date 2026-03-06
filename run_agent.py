@@ -83,6 +83,8 @@ from agent.prompt_builder import (
 from agent.model_metadata import (
     fetch_model_metadata, get_model_context_length,
     estimate_tokens_rough, estimate_messages_tokens_rough,
+    get_next_probe_tier, parse_context_limit_from_error,
+    save_context_length,
 )
 from agent.context_compressor import ContextCompressor
 from agent.prompt_caching import apply_anthropic_cache_control
@@ -544,6 +546,7 @@ class AIAgent:
             summary_target_tokens=500,
             summary_model_override=compression_summary_model,
             quiet_mode=self.quiet_mode,
+            base_url=self.base_url,
         )
         self.compression_enabled = compression_enabled
         self._user_turn_count = 0
@@ -2504,6 +2507,7 @@ class AIAgent:
                         role_filter=function_args.get("role_filter"),
                         limit=function_args.get("limit", 3),
                         db=self._session_db,
+                        current_session_id=self.session_id,
                     )
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
@@ -2687,7 +2691,15 @@ class AIAgent:
         messages.append({"role": "user", "content": summary_request})
 
         try:
-            api_messages = messages.copy()
+            # Build API messages, stripping internal-only fields
+            # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
+            api_messages = []
+            for msg in messages:
+                api_msg = msg.copy()
+                for internal_field in ("reasoning", "finish_reason"):
+                    api_msg.pop(internal_field, None)
+                api_messages.append(api_msg)
+
             effective_system = self._cached_system_prompt or ""
             if self.ephemeral_system_prompt:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
@@ -2770,7 +2782,7 @@ class AIAgent:
                         "messages": api_messages,
                     }
                     if self.max_tokens is not None:
-                        summary_kwargs["max_tokens"] = self.max_tokens
+                        summary_kwargs.update(self._max_tokens_param(self.max_tokens))
                     if summary_extra_body:
                         summary_kwargs["extra_body"] = summary_extra_body
 
@@ -2784,7 +2796,10 @@ class AIAgent:
                 if final_response:
                     if "<think>" in final_response:
                         final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
-                    messages.append({"role": "assistant", "content": final_response})
+                    if final_response:
+                        messages.append({"role": "assistant", "content": final_response})
+                    else:
+                        final_response = "I reached the iteration limit and couldn't generate a summary."
                 else:
                     final_response = "I reached the iteration limit and couldn't generate a summary."
 
@@ -2899,6 +2914,51 @@ class AIAgent:
                     logger.debug("Session DB update_system_prompt failed: %s", e)
 
         active_system_prompt = self._cached_system_prompt
+
+        # ── Preflight context compression ──
+        # Before entering the main loop, check if the loaded conversation
+        # history already exceeds the model's context threshold.  This handles
+        # cases where a user switches to a model with a smaller context window
+        # while having a large existing session — compress proactively rather
+        # than waiting for an API error (which might be caught as a non-retryable
+        # 4xx and abort the request entirely).
+        if (
+            self.compression_enabled
+            and len(messages) > self.context_compressor.protect_first_n
+                                + self.context_compressor.protect_last_n + 1
+        ):
+            _sys_tok_est = estimate_tokens_rough(active_system_prompt or "")
+            _msg_tok_est = estimate_messages_tokens_rough(messages)
+            _preflight_tokens = _sys_tok_est + _msg_tok_est
+
+            if _preflight_tokens >= self.context_compressor.threshold_tokens:
+                logger.info(
+                    "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                    f"{_preflight_tokens:,}",
+                    f"{self.context_compressor.threshold_tokens:,}",
+                    self.model,
+                    f"{self.context_compressor.context_length:,}",
+                )
+                if not self.quiet_mode:
+                    print(
+                        f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
+                        f">= {self.context_compressor.threshold_tokens:,} threshold"
+                    )
+                # May need multiple passes for very large sessions with small
+                # context windows (each pass summarises the middle N turns).
+                for _pass in range(3):
+                    _orig_len = len(messages)
+                    messages, active_system_prompt = self._compress_context(
+                        messages, system_message, approx_tokens=_preflight_tokens
+                    )
+                    if len(messages) >= _orig_len:
+                        break  # Cannot compress further
+                    # Re-estimate after compression
+                    _sys_tok_est = estimate_tokens_rough(active_system_prompt or "")
+                    _msg_tok_est = estimate_messages_tokens_rough(messages)
+                    _preflight_tokens = _sys_tok_est + _msg_tok_est
+                    if _preflight_tokens < self.context_compressor.threshold_tokens:
+                        break  # Under threshold
 
         # Main conversation loop
         api_call_count = 0
@@ -3218,6 +3278,13 @@ class AIAgent:
                         }
                         self.context_compressor.update_from_response(usage_dict)
 
+                        # Cache discovered context length after successful call
+                        if self.context_compressor._context_probed:
+                            ctx = self.context_compressor.context_length
+                            save_context_length(self.model, self.base_url, ctx)
+                            print(f"{self.log_prefix}💾 Cached context length: {ctx:,} tokens for {self.model}")
+                            self.context_compressor._context_probed = False
+
                         self.session_prompt_tokens += prompt_tokens
                         self.session_completion_tokens += completion_tokens
                         self.session_total_tokens += total_tokens
@@ -3325,18 +3392,73 @@ class AIAgent:
                                 "partial": True
                             }
 
+                    # Check for context-length errors BEFORE generic 4xx handler.
+                    # Local backends (LM Studio, Ollama, llama.cpp) often return
+                    # HTTP 400 with messages like "Context size has been exceeded"
+                    # which must trigger compression, not an immediate abort.
+                    is_context_length_error = any(phrase in error_msg for phrase in [
+                        'context length', 'context size', 'maximum context',
+                        'token limit', 'too many tokens', 'reduce the length',
+                        'exceeds the limit', 'context window',
+                        'request entity too large',  # OpenRouter/Nous 413 safety net
+                    ])
+                    
+                    if is_context_length_error:
+                        compressor = self.context_compressor
+                        old_ctx = compressor.context_length
+
+                        # Try to parse the actual limit from the error message
+                        parsed_limit = parse_context_limit_from_error(error_msg)
+                        if parsed_limit and parsed_limit < old_ctx:
+                            new_ctx = parsed_limit
+                            print(f"{self.log_prefix}⚠️  Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})")
+                        else:
+                            # Step down to the next probe tier
+                            new_ctx = get_next_probe_tier(old_ctx)
+
+                        if new_ctx and new_ctx < old_ctx:
+                            compressor.context_length = new_ctx
+                            compressor.threshold_tokens = int(new_ctx * compressor.threshold_percent)
+                            compressor._context_probed = True
+                            print(f"{self.log_prefix}⚠️  Context length exceeded — stepping down: {old_ctx:,} → {new_ctx:,} tokens")
+                        else:
+                            print(f"{self.log_prefix}⚠️  Context length exceeded at minimum tier — attempting compression...")
+
+                        original_len = len(messages)
+                        messages, active_system_prompt = self._compress_context(
+                            messages, system_message, approx_tokens=approx_tokens
+                        )
+
+                        if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
+                            if len(messages) < original_len:
+                                print(f"{self.log_prefix}   🗜️  Compressed {original_len} → {len(messages)} messages, retrying...")
+                            continue  # Retry with compressed messages or new tier
+                        else:
+                            # Can't compress further and already at minimum tier
+                            print(f"{self.log_prefix}❌ Context length exceeded and cannot compress further.")
+                            print(f"{self.log_prefix}   💡 The conversation has accumulated too much content.")
+                            logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
+                            self._persist_session(messages, conversation_history)
+                            return {
+                                "messages": messages,
+                                "completed": False,
+                                "api_calls": api_call_count,
+                                "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
+                                "partial": True
+                            }
+
                     # Check for non-retryable client errors (4xx HTTP status codes).
                     # These indicate a problem with the request itself (bad model ID,
                     # invalid API key, forbidden, etc.) and will never succeed on retry.
-                    # Note: 413 is excluded — it's handled above via compression.
+                    # Note: 413 and context-length errors are excluded — handled above.
                     is_client_status_error = isinstance(status_code, int) and 400 <= status_code < 500 and status_code != 413
-                    is_client_error = is_client_status_error or any(phrase in error_msg for phrase in [
-                        'error code: 400', 'error code: 401', 'error code: 403',
+                    is_client_error = (is_client_status_error or any(phrase in error_msg for phrase in [
+                        'error code: 401', 'error code: 403',
                         'error code: 404', 'error code: 422',
                         'is not a valid model', 'invalid model', 'model not found',
                         'invalid api key', 'invalid_api_key', 'authentication',
                         'unauthorized', 'forbidden', 'not found',
-                    ])
+                    ])) and not is_context_length_error
 
                     if is_client_error:
                         self._dump_api_request_debug(
@@ -3354,39 +3476,7 @@ class AIAgent:
                             "failed": True,
                             "error": str(api_error),
                         }
-                    
-                    # Check for non-retryable errors (context length exceeded)
-                    is_context_length_error = any(phrase in error_msg for phrase in [
-                        'context length', 'maximum context', 'token limit',
-                        'too many tokens', 'reduce the length', 'exceeds the limit',
-                        'request entity too large',  # OpenRouter/Nous 413 safety net
-                    ])
-                    
-                    if is_context_length_error:
-                        print(f"{self.log_prefix}⚠️  Context length exceeded - attempting compression...")
-                        
-                        original_len = len(messages)
-                        messages, active_system_prompt = self._compress_context(
-                            messages, system_message, approx_tokens=approx_tokens
-                        )
-                        
-                        if len(messages) < original_len:
-                            print(f"{self.log_prefix}   🗜️  Compressed {original_len} → {len(messages)} messages, retrying...")
-                            continue  # Retry with compressed messages
-                        else:
-                            # Can't compress further
-                            print(f"{self.log_prefix}❌ Context length exceeded and cannot compress further.")
-                            print(f"{self.log_prefix}   💡 The conversation has accumulated too much content.")
-                            logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
-                            self._persist_session(messages, conversation_history)
-                            return {
-                                "messages": messages,
-                                "completed": False,
-                                "api_calls": api_call_count,
-                                "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
-                                "partial": True
-                            }
-                    
+
                     if retry_count >= max_retries:
                         print(f"{self.log_prefix}❌ Max retries ({max_retries}) exceeded. Giving up.")
                         logging.error(f"{self.log_prefix}API call failed after {max_retries} retries. Last error: {api_error}")

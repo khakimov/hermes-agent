@@ -116,14 +116,29 @@ terminal:
 #   timeout: 180
 #   lifetime_seconds: 300
 #   modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+
+# -----------------------------------------------------------------------------
+# OPTION 6: Daytona cloud execution
+# Commands run in Daytona cloud sandboxes
+# Great for: Cloud dev environments, persistent workspaces, team collaboration
+# Requires: pip install daytona, DAYTONA_API_KEY env var
+# -----------------------------------------------------------------------------
+# terminal:
+#   backend: "daytona"
+#   cwd: "~"
+#   timeout: 180
+#   lifetime_seconds: 300
+#   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+#   container_disk: 10240          # Daytona max is 10GB per sandbox
+
 #
-# --- Container resource limits (docker, singularity, modal -- ignored for local/ssh) ---
+# --- Container resource limits (docker, singularity, modal, daytona -- ignored for local/ssh) ---
 # These settings apply to all container backends. They control the resources
 # allocated to the sandbox and whether its filesystem persists across sessions.
-#   container_cpu: 1              # CPU cores (default: 1)
-#   container_memory: 5120        # Memory in MB (default: 5120 = 5GB)
-#   container_disk: 51200         # Disk in MB (default: 51200 = 50GB)
-#   container_persistent: true    # Persist filesystem across sessions (default: true)
+  container_cpu: 1              # CPU cores
+  container_memory: 5120        # Memory in MB (5120 = 5GB)
+  container_disk: 51200         # Disk in MB (51200 = 50GB)
+  container_persistent: true    # Persist filesystem across sessions (false = ephemeral)
 
 # -----------------------------------------------------------------------------
 # SUDO SUPPORT (works with ALL backends above)
