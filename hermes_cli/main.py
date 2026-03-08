@@ -64,7 +64,13 @@ def _has_any_provider_configured() -> bool:
     # Check env vars (may be set by .env or shell).
     # OPENAI_BASE_URL alone counts — local models (vLLM, llama.cpp, etc.)
     # often don't require an API key.
-    provider_env_vars = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL")
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    # Collect all provider env vars
+    provider_env_vars = {"OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL"}
+    for pconfig in PROVIDER_REGISTRY.values():
+        if pconfig.auth_type == "api_key":
+            provider_env_vars.update(pconfig.api_key_env_vars)
     if any(os.getenv(v) for v in provider_env_vars):
         return True
 
@@ -143,6 +149,13 @@ def cmd_chat(args):
         print("You can run 'hermes setup' at any time to configure.")
         sys.exit(1)
 
+    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
+    try:
+        from tools.skills_sync import sync_skills
+        sync_skills(quiet=True)
+    except Exception:
+        pass
+
     # Import and run the CLI
     from cli import main as cli_main
     
@@ -154,6 +167,7 @@ def cmd_chat(args):
         "verbose": args.verbose,
         "query": args.query,
         "resume": getattr(args, "resume", None),
+        "worktree": getattr(args, "worktree", False),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -404,6 +418,10 @@ def cmd_model(args):
         "openrouter": "OpenRouter",
         "nous": "Nous Portal",
         "openai-codex": "OpenAI Codex",
+        "zai": "Z.AI / GLM",
+        "kimi-coding": "Kimi / Moonshot",
+        "minimax": "MiniMax",
+        "minimax-cn": "MiniMax (China)",
         "custom": "Custom endpoint",
     }
     active_label = provider_labels.get(active, active)
@@ -418,11 +436,16 @@ def cmd_model(args):
         ("openrouter", "OpenRouter (100+ models, pay-per-use)"),
         ("nous", "Nous Portal (Nous Research subscription)"),
         ("openai-codex", "OpenAI Codex"),
+        ("zai", "Z.AI / GLM (Zhipu AI direct API)"),
+        ("kimi-coding", "Kimi / Moonshot (Moonshot AI direct API)"),
+        ("minimax", "MiniMax (global direct API)"),
+        ("minimax-cn", "MiniMax China (domestic direct API)"),
         ("custom", "Custom endpoint (self-hosted / VLLM / etc.)"),
     ]
 
     # Reorder so the active provider is at the top
-    active_key = active if active in ("openrouter", "nous", "openai-codex") else "custom"
+    known_keys = {k for k, _ in providers}
+    active_key = active if active in known_keys else "custom"
     ordered = []
     for key, label in providers:
         if key == active_key:
@@ -447,6 +470,8 @@ def cmd_model(args):
         _model_flow_openai_codex(config, current_model)
     elif selected_provider == "custom":
         _model_flow_custom(config)
+    elif selected_provider in ("zai", "kimi-coding", "minimax", "minimax-cn"):
+        _model_flow_api_key_provider(config, selected_provider, current_model)
 
 
 def _prompt_provider_choice(choices):
@@ -716,6 +741,117 @@ def _model_flow_custom(config):
         print("Endpoint saved. Use `/model` in chat or `hermes model` to set a model.")
 
 
+# Curated model lists for direct API-key providers
+_PROVIDER_MODELS = {
+    "zai": [
+        "glm-5",
+        "glm-4.7",
+        "glm-4.5",
+        "glm-4.5-flash",
+    ],
+    "kimi-coding": [
+        "kimi-k2.5",
+        "kimi-k2-thinking",
+        "kimi-k2-turbo-preview",
+        "kimi-k2-0905-preview",
+    ],
+    "minimax": [
+        "MiniMax-M2.5",
+        "MiniMax-M2.5-highspeed",
+        "MiniMax-M2.1",
+    ],
+    "minimax-cn": [
+        "MiniMax-M2.5",
+        "MiniMax-M2.5-highspeed",
+        "MiniMax-M2.1",
+    ],
+}
+
+
+def _model_flow_api_key_provider(config, provider_id, current_model=""):
+    """Generic flow for API-key providers (z.ai, Kimi, MiniMax)."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY, _prompt_model_selection, _save_model_choice,
+        _update_config_for_provider, deactivate_provider,
+    )
+    from hermes_cli.config import get_env_value, save_env_value, load_config, save_config
+
+    pconfig = PROVIDER_REGISTRY[provider_id]
+    key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
+    base_url_env = pconfig.base_url_env_var or ""
+
+    # Check / prompt for API key
+    existing_key = ""
+    for ev in pconfig.api_key_env_vars:
+        existing_key = get_env_value(ev) or os.getenv(ev, "")
+        if existing_key:
+            break
+
+    if not existing_key:
+        print(f"No {pconfig.name} API key configured.")
+        if key_env:
+            try:
+                new_key = input(f"{key_env} (or Enter to cancel): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return
+            if not new_key:
+                print("Cancelled.")
+                return
+            save_env_value(key_env, new_key)
+            print("API key saved.")
+            print()
+    else:
+        print(f"  {pconfig.name} API key: {existing_key[:8]}... ✓")
+        print()
+
+    # Optional base URL override
+    current_base = ""
+    if base_url_env:
+        current_base = get_env_value(base_url_env) or os.getenv(base_url_env, "")
+    effective_base = current_base or pconfig.inference_base_url
+
+    try:
+        override = input(f"Base URL [{effective_base}]: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        override = ""
+    if override and base_url_env:
+        save_env_value(base_url_env, override)
+        effective_base = override
+
+    # Model selection
+    model_list = _PROVIDER_MODELS.get(provider_id, [])
+    if model_list:
+        selected = _prompt_model_selection(model_list, current_model=current_model)
+    else:
+        try:
+            selected = input("Model name: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            selected = None
+
+    if selected:
+        # Clear custom endpoint if set (avoid confusion)
+        if get_env_value("OPENAI_BASE_URL"):
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+
+        _save_model_choice(selected)
+
+        # Update config with provider and base URL
+        cfg = load_config()
+        model = cfg.get("model")
+        if isinstance(model, dict):
+            model["provider"] = provider_id
+            model["base_url"] = effective_base
+        save_config(cfg)
+        deactivate_provider()
+
+        print(f"Default model set to: {selected} (via {pconfig.name})")
+    else:
+        print("No change.")
+
+
 def cmd_login(args):
     """Authenticate Hermes CLI with a provider."""
     from hermes_cli.auth import login_command
@@ -851,11 +987,17 @@ def _update_via_zip(args):
     # Sync skills
     try:
         from tools.skills_sync import sync_skills
-        print("→ Checking for new bundled skills...")
+        print("→ Syncing bundled skills...")
         result = sync_skills(quiet=True)
         if result["copied"]:
-            print(f"  + {len(result['copied'])} new skill(s): {', '.join(result['copied'])}")
-        else:
+            print(f"  + {len(result['copied'])} new: {', '.join(result['copied'])}")
+        if result.get("updated"):
+            print(f"  ↑ {len(result['updated'])} updated: {', '.join(result['updated'])}")
+        if result.get("user_modified"):
+            print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
+        if result.get("cleaned"):
+            print(f"  − {len(result['cleaned'])} removed from manifest")
+        if not result["copied"] and not result.get("updated"):
             print("  ✓ Skills are up to date")
     except Exception:
         pass
@@ -961,15 +1103,21 @@ def cmd_update(args):
         print()
         print("✓ Code updated!")
         
-        # Sync any new bundled skills (manifest-based -- won't overwrite or re-add deleted skills)
+        # Sync bundled skills (copies new, updates changed, respects user deletions)
         try:
             from tools.skills_sync import sync_skills
             print()
-            print("→ Checking for new bundled skills...")
+            print("→ Syncing bundled skills...")
             result = sync_skills(quiet=True)
             if result["copied"]:
-                print(f"  + {len(result['copied'])} new skill(s): {', '.join(result['copied'])}")
-            else:
+                print(f"  + {len(result['copied'])} new: {', '.join(result['copied'])}")
+            if result.get("updated"):
+                print(f"  ↑ {len(result['updated'])} updated: {', '.join(result['updated'])}")
+            if result.get("user_modified"):
+                print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
+            if result.get("cleaned"):
+                print(f"  − {len(result['cleaned'])} removed from manifest")
+            if not result["copied"] and not result.get("updated"):
                 print("  ✓ Skills are up to date")
         except Exception as e:
             logger.debug("Skills sync during update failed: %s", e)
@@ -1070,6 +1218,7 @@ Examples:
     hermes config edit            Edit config in $EDITOR
     hermes config set model gpt-4 Set a config value
     hermes gateway                Run messaging gateway
+    hermes -w                     Start in isolated git worktree
     hermes gateway install        Install as system service
     hermes sessions list          List past sessions
     hermes update                 Update to latest version
@@ -1097,6 +1246,12 @@ For more help on a command:
         default=False,
         help="Resume the most recent CLI session"
     )
+    parser.add_argument(
+        "--worktree", "-w",
+        action="store_true",
+        default=False,
+        help="Run in an isolated git worktree (for parallel agents)"
+    )
     
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
     
@@ -1122,7 +1277,7 @@ For more help on a command:
     )
     chat_parser.add_argument(
         "--provider",
-        choices=["auto", "openrouter", "nous", "openai-codex"],
+        choices=["auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn"],
         default=None,
         help="Inference provider (default: auto)"
     )
@@ -1142,6 +1297,12 @@ For more help on a command:
         action="store_true",
         default=False,
         help="Resume the most recent CLI session"
+    )
+    chat_parser.add_argument(
+        "--worktree", "-w",
+        action="store_true",
+        default=False,
+        help="Run in an isolated git worktree (for parallel agents on the same repo)"
     )
     chat_parser.set_defaults(func=cmd_chat)
 
@@ -1168,6 +1329,8 @@ For more help on a command:
     # gateway run (default)
     gateway_run = gateway_subparsers.add_parser("run", help="Run gateway in foreground")
     gateway_run.add_argument("-v", "--verbose", action="store_true")
+    gateway_run.add_argument("--replace", action="store_true",
+                             help="Replace any existing gateway instance (useful for systemd)")
     
     # gateway start
     gateway_start = gateway_subparsers.add_parser("start", help="Start gateway service")
@@ -1200,7 +1363,15 @@ For more help on a command:
     setup_parser = subparsers.add_parser(
         "setup",
         help="Interactive setup wizard",
-        description="Configure Hermes Agent with an interactive wizard"
+        description="Configure Hermes Agent with an interactive wizard. "
+                    "Run a specific section: hermes setup model|terminal|gateway|tools|agent"
+    )
+    setup_parser.add_argument(
+        "section",
+        nargs="?",
+        choices=["model", "terminal", "gateway", "tools", "agent"],
+        default=None,
+        help="Run a specific setup section instead of the full wizard"
     )
     setup_parser.add_argument(
         "--non-interactive",
@@ -1611,6 +1782,32 @@ For more help on a command:
     sessions_parser.set_defaults(func=cmd_sessions)
 
     # =========================================================================
+    # insights command
+    # =========================================================================
+    insights_parser = subparsers.add_parser(
+        "insights",
+        help="Show usage insights and analytics",
+        description="Analyze session history to show token usage, costs, tool patterns, and activity trends"
+    )
+    insights_parser.add_argument("--days", type=int, default=30, help="Number of days to analyze (default: 30)")
+    insights_parser.add_argument("--source", help="Filter by platform (cli, telegram, discord, etc.)")
+
+    def cmd_insights(args):
+        try:
+            from hermes_state import SessionDB
+            from agent.insights import InsightsEngine
+
+            db = SessionDB()
+            engine = InsightsEngine(db)
+            report = engine.generate(days=args.days, source=args.source)
+            print(engine.format_terminal(report))
+            db.close()
+        except Exception as e:
+            print(f"Error generating insights: {e}")
+
+    insights_parser.set_defaults(func=cmd_insights)
+
+    # =========================================================================
     # version command
     # =========================================================================
     version_parser = subparsers.add_parser(
@@ -1667,6 +1864,8 @@ For more help on a command:
         args.provider = None
         args.toolsets = None
         args.verbose = False
+        if not hasattr(args, "worktree"):
+            args.worktree = False
         cmd_chat(args)
         return
     
@@ -1679,6 +1878,8 @@ For more help on a command:
         args.verbose = False
         args.resume = None
         args.continue_last = False
+        if not hasattr(args, "worktree"):
+            args.worktree = False
         cmd_chat(args)
         return
     

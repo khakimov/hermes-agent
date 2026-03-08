@@ -98,7 +98,7 @@ The main agent is implemented in `run_agent.py`:
 class AIAgent:
     def __init__(
         self,
-        model: str = "anthropic/claude-sonnet-4",
+        model: str = "anthropic/claude-sonnet-4.6",
         api_key: str = None,
         base_url: str = "https://openrouter.ai/api/v1",
         max_iterations: int = 60,        # Max tool-calling loops
@@ -204,7 +204,7 @@ Every installed skill in `~/.hermes/skills/` is automatically registered as a sl
 The skill name (from frontmatter or folder name) becomes the command: `axolotl` → `/axolotl`.
 
 Implementation (`agent/skill_commands.py`, shared between CLI and gateway):
-1. `scan_skill_commands()` scans all SKILL.md files at startup
+1. `scan_skill_commands()` scans all SKILL.md files at startup, filtering out skills incompatible with the current OS platform (via the `platforms` frontmatter field)
 2. `build_skill_invocation_message()` loads the SKILL.md content and builds a user-turn message
 3. The message includes the full skill content, a list of supporting files (not loaded), and the user's instruction
 4. Supporting files can be loaded on demand via the `skill_view` tool
@@ -226,6 +226,7 @@ The unified `hermes` command provides all functionality:
 |---------|-------------|
 | `hermes` | Interactive chat (default) |
 | `hermes chat -q "..."` | Single query mode |
+| `hermes -w` / `hermes --worktree` | Start in isolated git worktree (for parallel agents) |
 | `hermes setup` | Configure API keys and settings |
 | `hermes config` | View current configuration |
 | `hermes config edit` | Open config in editor |
@@ -657,6 +658,7 @@ SKILL.md files use YAML frontmatter (agentskills.io format):
 name: skill-name
 description: Brief description for listing
 version: 1.0.0
+platforms: [macos]              # Optional — restrict to specific OS (macos/linux/windows)
 metadata:
   hermes:
     tags: [tag1, tag2]
@@ -665,6 +667,8 @@ metadata:
 # Skill Content...
 ```
 
+**Platform filtering** — Skills with a `platforms` field are automatically excluded from the system prompt index, `skills_list()`, and slash commands on incompatible platforms. Skills without the field load everywhere (backward compatible). See `skills/apple/` for macOS-only examples (iMessage, Reminders, Notes, FindMy).
+
 **Skills Hub** — user-driven skill search/install from online registries and official optional skills. Sources: official optional skills (shipped with repo, labeled "official"), GitHub (openai/skills, anthropics/skills, custom taps), ClawHub, Claude marketplace, LobeHub. Not exposed as an agent tool — the model cannot search for or install skills. Users manage skills via `hermes skills browse/search/install` CLI commands or the `/skills` slash command in chat.
 
 Key files:
@@ -672,6 +676,28 @@ Key files:
 - `tools/skills_guard.py` — Security scanner (regex + LLM audit, trust-aware install policy)
 - `tools/skills_hub.py` — Source adapters (OptionalSkillSource, GitHub, ClawHub, Claude marketplace, LobeHub), lock file, auth
 - `hermes_cli/skills_hub.py` — CLI subcommands + `/skills` slash command handler
+
+---
+
+## Known Pitfalls
+
+### DO NOT use `simple_term_menu` for interactive menus
+
+`simple_term_menu` has rendering bugs in tmux, iTerm2, and other non-standard terminals. When the user scrolls with arrow keys, previously highlighted items "ghost" — duplicating upward and corrupting the display. This happens because the library uses ANSI cursor-up codes to redraw in place, and tmux/iTerm miscalculate positions when the menu is near the bottom of the viewport.
+
+**Rule:** All interactive menus in `hermes_cli/` must use `curses` (Python stdlib) instead. See `tools_config.py` for the pattern — both `_prompt_choice()` (single-select) and `_prompt_toolset_checklist()` (multi-select with space toggle) use `curses.wrapper()`. The numbered-input fallback handles Windows where curses isn't available.
+
+### DO NOT use `\033[K` (ANSI erase-to-EOL) in spinner/display code
+
+The ANSI escape `\033[K` leaks as literal `?[K` text when `prompt_toolkit`'s `patch_stdout` is active. Use space-padding instead to clear lines: `f"\r{line}{' ' * pad}"`. See `agent/display.py` `KawaiiSpinner`.
+
+### `_last_resolved_tool_names` is a process-global in `model_tools.py`
+
+The `execute_code` sandbox uses `_last_resolved_tool_names` (set by `get_tool_definitions()`) to decide which tool stubs to generate. When subagents run with restricted toolsets, they overwrite this global. After delegation returns to the parent, `execute_code` may see the child's restricted list instead of the parent's full list. This is a known bug — `execute_code` calls after delegation may fail with `ImportError: cannot import name 'patch' from 'hermes_tools'`.
+
+### Tests must not write to `~/.hermes/`
+
+The `autouse` fixture `_isolate_hermes_home` in `tests/conftest.py` redirects `HERMES_HOME` to a temp dir. Every test runs in isolation. If you add a test that creates `AIAgent` instances or writes session logs, the fixture handles cleanup automatically. Never hardcode `~/.hermes/` paths in tests.
 
 ---
 

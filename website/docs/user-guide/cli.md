@@ -33,6 +33,10 @@ hermes --resume <session_id>  # Resume a specific session by ID (-r)
 
 # Verbose mode (debug output)
 hermes chat --verbose
+
+# Isolated git worktree (for running multiple agents in parallel)
+hermes -w                         # Interactive mode in worktree
+hermes -w -q "Fix issue #123"     # Single query in worktree
 ```
 
 ## Interface Layout
@@ -91,7 +95,8 @@ Type `/` to see an autocomplete dropdown of all available commands.
 |---------|-------------|
 | `/tools` | List all available tools grouped by toolset |
 | `/toolsets` | List available toolsets with descriptions |
-| `/model [name]` | Show or change the current model |
+| `/model [provider:model]` | Show or change the current model (supports `provider:model` syntax) |
+| `/provider` | Show available providers with auth status |
 | `/config` | Show current configuration |
 | `/prompt [text]` | View/set/clear custom system prompt |
 | `/personality [name]` | Set a predefined personality |
@@ -106,6 +111,7 @@ Type `/` to see an autocomplete dropdown of all available commands.
 | `/save` | Save the current conversation |
 | `/compress` | Manually compress conversation context |
 | `/usage` | Show token usage for this session |
+| `/insights [--days N]` | Show usage insights and analytics (last 30 days) |
 
 ### Skills & Scheduling
 

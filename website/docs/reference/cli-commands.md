@@ -19,9 +19,10 @@ These are commands you run from your shell.
 | `hermes chat --continue` / `-c` | Resume the most recent session |
 | `hermes chat --resume <id>` / `-r <id>` | Resume a specific session |
 | `hermes chat --model <name>` | Use a specific model |
-| `hermes chat --provider <name>` | Force a provider (`nous`, `openrouter`) |
+| `hermes chat --provider <name>` | Force a provider (`nous`, `openrouter`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`) |
 | `hermes chat --toolsets "web,terminal"` / `-t` | Use specific toolsets |
 | `hermes chat --verbose` | Enable verbose/debug output |
+| `hermes --worktree` / `-w` | Start in an isolated git worktree (for parallel agents) |
 
 ### Provider & Model Management
 
@@ -108,6 +109,14 @@ These are commands you run from your shell.
 | `hermes sessions prune` | Remove old sessions |
 | `hermes sessions stats` | Show session statistics |
 
+### Insights
+
+| Command | Description |
+|---------|-------------|
+| `hermes insights` | Show usage analytics for the last 30 days |
+| `hermes insights --days 7` | Analyze a custom time window |
+| `hermes insights --source telegram` | Filter by platform |
+
 ---
 
 ## Slash Commands (Inside Chat)
@@ -130,7 +139,8 @@ Type `/` in the interactive CLI to see an autocomplete dropdown.
 |---------|-------------|
 | `/tools` | List all available tools |
 | `/toolsets` | List available toolsets |
-| `/model [name]` | Show or change the current model |
+| `/model [provider:model]` | Show or change the current model (supports `provider:model` syntax to switch providers) |
+| `/provider` | Show available providers with auth status |
 | `/config` | Show current configuration |
 | `/prompt [text]` | View/set custom system prompt |
 | `/personality [name]` | Set a predefined personality |
@@ -145,6 +155,7 @@ Type `/` in the interactive CLI to see an autocomplete dropdown.
 | `/save` | Save the current conversation |
 | `/compress` | Manually compress conversation context |
 | `/usage` | Show token usage for this session |
+| `/insights [--days N]` | Show usage insights and analytics (last 30 days) |
 
 ### Media & Input
 
