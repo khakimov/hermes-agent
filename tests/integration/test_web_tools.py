@@ -3,7 +3,7 @@
 Comprehensive Test Suite for Web Tools Module
 
 This script tests all web tools functionality to ensure they work correctly.
-Run this after any updates to the web_tools.py module or Firecrawl library.
+Run this after any updates to the web_tools.py module or backend libraries.
 
 Usage:
     python test_web_tools.py              # Run all tests
@@ -11,8 +11,8 @@ Usage:
     python test_web_tools.py --verbose    # Show detailed output
 
 Requirements:
-    - FIRECRAWL_API_KEY environment variable must be set
-    - NOUS_API_KEY environment variable (optional, for LLM tests)
+    - PARALLEL_API_KEY or FIRECRAWL_API_KEY environment variable must be set
+    - An auxiliary LLM provider (OPENROUTER_API_KEY or Nous Portal auth) (optional, for LLM tests)
 """
 
 import pytest
@@ -28,12 +28,14 @@ from typing import List
 
 # Import the web tools to test (updated path after moving tools/)
 from tools.web_tools import (
-    web_search_tool, 
-    web_extract_tool, 
+    web_search_tool,
+    web_extract_tool,
     web_crawl_tool,
     check_firecrawl_api_key,
+    check_web_api_key,
     check_auxiliary_model,
-    get_debug_session_info
+    get_debug_session_info,
+    _get_backend,
 )
 
 
@@ -121,19 +123,20 @@ class WebToolsTester:
         """Test environment setup and API keys"""
         print_section("Environment Check")
         
-        # Check Firecrawl API key
-        if not check_firecrawl_api_key():
-            self.log_result("Firecrawl API Key", "failed", "FIRECRAWL_API_KEY not set")
+        # Check web backend API key (Parallel or Firecrawl)
+        if not check_web_api_key():
+            self.log_result("Web Backend API Key", "failed", "PARALLEL_API_KEY or FIRECRAWL_API_KEY not set")
             return False
         else:
-            self.log_result("Firecrawl API Key", "passed", "Found")
+            backend = _get_backend()
+            self.log_result("Web Backend API Key", "passed", f"Using {backend} backend")
         
-        # Check Nous API key (optional)
+        # Check auxiliary LLM provider (optional)
         if not check_auxiliary_model():
-            self.log_result("Nous API Key", "skipped", "NOUS_API_KEY not set (LLM tests will be skipped)")
+            self.log_result("Auxiliary LLM", "skipped", "No auxiliary LLM provider available (LLM tests will be skipped)")
             self.test_llm = False
         else:
-            self.log_result("Nous API Key", "passed", "Found")
+            self.log_result("Auxiliary LLM", "passed", "Found")
         
         # Check debug mode
         debug_info = get_debug_session_info()
@@ -578,8 +581,10 @@ class WebToolsTester:
             },
             "results": self.test_results,
             "environment": {
+                "web_backend": _get_backend() if check_web_api_key() else None,
                 "firecrawl_api_key": check_firecrawl_api_key(),
-                "nous_api_key": check_auxiliary_model(),
+                "parallel_api_key": bool(os.getenv("PARALLEL_API_KEY")),
+                "auxiliary_model": check_auxiliary_model(),
                 "debug_mode": get_debug_session_info()["enabled"]
             }
         }

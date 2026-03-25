@@ -49,3 +49,8 @@ cli-config.yaml
 skills/.hub/
 ignored/
 .worktrees/
+environments/benchmarks/evals/
+
+# Release script temp files
+.release_notes.md
+mini-swe-agent/

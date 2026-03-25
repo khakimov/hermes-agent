@@ -8,8 +8,9 @@ Hooks are discovered from ~/.hermes/hooks/ directories, each containing:
 
 Events:
   - gateway:startup     -- Gateway process starts
-  - session:start       -- New session created
-  - session:reset       -- User ran /new or /reset
+  - session:start       -- New session created (first message of a new session)
+  - session:end         -- Session ends (user ran /new or /reset)
+  - session:reset       -- Session reset completed (new session entry created)
   - agent:start         -- Agent begins processing a message
   - agent:step          -- Each turn in the tool-calling loop
   - agent:end           -- Agent finishes processing
@@ -32,7 +33,10 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-HOOKS_DIR = Path(os.path.expanduser("~/.hermes/hooks"))
+from hermes_cli.config import get_hermes_home
+
+
+HOOKS_DIR = get_hermes_home() / "hooks"
 
 # Module-level bridge so sync tool code can fire hooks without holding a
 # reference to the gateway's HookRegistry or event loop.  The gateway calls

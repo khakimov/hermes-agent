@@ -79,13 +79,20 @@ def _escape_mdv2(text: str) -> str:
 def _strip_mdv2(text: str) -> str:
     """Strip MarkdownV2 escape backslashes to produce clean plain text.
 
-    Also removes MarkdownV2 bold markers (*text* -> text) so the fallback
-    doesn't show stray asterisks from header/bold conversion.
+    Also removes MarkdownV2 formatting markers so the fallback
+    doesn't show stray syntax characters from format_message conversion.
     """
     # Remove escape backslashes before special characters
     cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)
     # Remove MarkdownV2 bold markers that format_message converted from **bold**
     cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
+    # Remove MarkdownV2 italic markers that format_message converted from *italic*
+    # Use word boundary (\b) to avoid breaking snake_case like my_variable_name
+    cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)
+    # Remove MarkdownV2 strikethrough markers (~text~ → text)
+    cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)
+    # Remove MarkdownV2 spoiler markers (||text|| → text)
+    cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)
     return cleaned
 
 
@@ -102,23 +109,203 @@ class TelegramAdapter(BasePlatformAdapter):
     
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
+    MEDIA_GROUP_WAIT_SECONDS = 0.8
     
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
-    
+        self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        # Buffer rapid/album photo updates so Telegram image bursts are handled
+        # as a single MessageEvent instead of self-interrupting multiple turns.
+        self._media_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", "0.8"))
+        self._pending_photo_batches: Dict[str, MessageEvent] = {}
+        self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._media_group_events: Dict[str, MessageEvent] = {}
+        self._media_group_tasks: Dict[str, asyncio.Task] = {}
+        # Buffer rapid text messages so Telegram client-side splits of long
+        # messages are aggregated into a single MessageEvent.
+        self._text_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
+        self._pending_text_batches: Dict[str, MessageEvent] = {}
+        self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._token_lock_identity: Optional[str] = None
+        self._polling_error_task: Optional[asyncio.Task] = None
+        self._polling_conflict_count: int = 0
+        self._polling_network_error_count: int = 0
+        self._polling_error_callback_ref = None
+
+    @staticmethod
+    def _looks_like_polling_conflict(error: Exception) -> bool:
+        text = str(error).lower()
+        return (
+            error.__class__.__name__.lower() == "conflict"
+            or "terminated by other getupdates request" in text
+            or "another bot instance is running" in text
+        )
+
+    @staticmethod
+    def _looks_like_network_error(error: Exception) -> bool:
+        """Return True for transient network errors that warrant a reconnect attempt."""
+        name = error.__class__.__name__.lower()
+        if name in ("networkerror", "timedout", "connectionerror"):
+            return True
+        try:
+            from telegram.error import NetworkError, TimedOut
+            if isinstance(error, (NetworkError, TimedOut)):
+                return True
+        except ImportError:
+            pass
+        return isinstance(error, OSError)
+
+    async def _handle_polling_network_error(self, error: Exception) -> None:
+        """Reconnect polling after a transient network interruption.
+
+        Triggered by NetworkError/TimedOut in the polling error callback, which
+        happen when the host loses connectivity (Mac sleep, WiFi switch, VPN
+        reconnect, etc.).  The gateway process stays alive but the long-poll
+        connection silently dies; without this handler the bot never recovers.
+
+        Strategy: exponential back-off (5s, 10s, 20s, 40s, 60s cap) up to
+        MAX_NETWORK_RETRIES attempts, then mark the adapter retryable-fatal so
+        the supervisor restarts the gateway process.
+        """
+        if self.has_fatal_error:
+            return
+
+        MAX_NETWORK_RETRIES = 10
+        BASE_DELAY = 5
+        MAX_DELAY = 60
+
+        self._polling_network_error_count += 1
+        attempt = self._polling_network_error_count
+
+        if attempt > MAX_NETWORK_RETRIES:
+            message = (
+                "Telegram polling could not reconnect after %d network error retries. "
+                "Restarting gateway." % MAX_NETWORK_RETRIES
+            )
+            logger.error("[%s] %s Last error: %s", self.name, message, error)
+            self._set_fatal_error("telegram_network_error", message, retryable=True)
+            await self._notify_fatal_error()
+            return
+
+        delay = min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY)
+        logger.warning(
+            "[%s] Telegram network error (attempt %d/%d), reconnecting in %ds. Error: %s",
+            self.name, attempt, MAX_NETWORK_RETRIES, delay, error,
+        )
+        await asyncio.sleep(delay)
+
+        try:
+            if self._app and self._app.updater and self._app.updater.running:
+                await self._app.updater.stop()
+        except Exception:
+            pass
+
+        try:
+            await self._app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,
+                error_callback=self._polling_error_callback_ref,
+            )
+            logger.info(
+                "[%s] Telegram polling resumed after network error (attempt %d)",
+                self.name, attempt,
+            )
+            self._polling_network_error_count = 0
+        except Exception as retry_err:
+            logger.warning("[%s] Telegram polling reconnect failed: %s", self.name, retry_err)
+            # The next network error will trigger another attempt.
+
+    async def _handle_polling_conflict(self, error: Exception) -> None:
+        if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
+            return
+        # Track consecutive conflicts — transient 409s can occur when a
+        # previous gateway instance hasn't fully released its long-poll
+        # session on Telegram's server (e.g. during --replace handoffs or
+        # systemd Restart=on-failure respawns).  Retry a few times before
+        # giving up, so the old session has time to expire.
+        self._polling_conflict_count += 1
+
+        MAX_CONFLICT_RETRIES = 3
+        RETRY_DELAY = 10  # seconds
+
+        if self._polling_conflict_count <= MAX_CONFLICT_RETRIES:
+            logger.warning(
+                "[%s] Telegram polling conflict (%d/%d), will retry in %ds. Error: %s",
+                self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
+                RETRY_DELAY, error,
+            )
+            try:
+                if self._app and self._app.updater and self._app.updater.running:
+                    await self._app.updater.stop()
+            except Exception:
+                pass
+            await asyncio.sleep(RETRY_DELAY)
+            try:
+                await self._app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=False,
+                    error_callback=self._polling_error_callback_ref,
+                )
+                logger.info("[%s] Telegram polling resumed after conflict retry %d", self.name, self._polling_conflict_count)
+                self._polling_conflict_count = 0  # reset on success
+                return
+            except Exception as retry_err:
+                logger.warning("[%s] Telegram polling retry failed: %s", self.name, retry_err)
+                # Don't fall through to fatal yet — wait for the next conflict
+                # to trigger another retry attempt (up to MAX_CONFLICT_RETRIES).
+                return
+
+        # Exhausted retries — fatal
+        message = (
+            "Another Telegram bot poller is already using this token. "
+            "Hermes stopped Telegram polling after %d retries. "
+            "Make sure only one gateway instance is running for this bot token."
+            % MAX_CONFLICT_RETRIES
+        )
+        logger.error("[%s] %s Original error: %s", self.name, message, error)
+        self._set_fatal_error("telegram_polling_conflict", message, retryable=False)
+        try:
+            if self._app and self._app.updater:
+                await self._app.updater.stop()
+        except Exception as stop_error:
+            logger.warning("[%s] Failed stopping Telegram polling after conflict: %s", self.name, stop_error, exc_info=True)
+        await self._notify_fatal_error()
+
     async def connect(self) -> bool:
         """Connect to Telegram and start polling for updates."""
         if not TELEGRAM_AVAILABLE:
-            print(f"[{self.name}] python-telegram-bot not installed. Run: pip install python-telegram-bot")
+            logger.error(
+                "[%s] python-telegram-bot not installed. Run: pip install python-telegram-bot",
+                self.name,
+            )
             return False
         
         if not self.config.token:
-            print(f"[{self.name}] No bot token configured")
+            logger.error("[%s] No bot token configured", self.name)
             return False
         
         try:
+            from gateway.status import acquire_scoped_lock
+
+            self._token_lock_identity = self.config.token
+            acquired, existing = acquire_scoped_lock(
+                "telegram-bot-token",
+                self._token_lock_identity,
+                metadata={"platform": self.platform.value},
+            )
+            if not acquired:
+                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
+                message = (
+                    "Another local Hermes gateway is already using this Telegram bot token"
+                    + (f" (PID {owner_pid})." if owner_pid else ".")
+                    + " Stop the other gateway before starting a second Telegram poller."
+                )
+                logger.error("[%s] %s", self.name, message)
+                self._set_fatal_error("telegram_token_lock", message, retryable=False)
+                return False
+
             # Build the application
             self._app = Application.builder().token(self.config.token).build()
             self._bot = self._app.bot
@@ -133,56 +320,149 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._handle_command
             ))
             self._app.add_handler(TelegramMessageHandler(
+                filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
+                self._handle_location_message
+            ))
+            self._app.add_handler(TelegramMessageHandler(
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
             
-            # Start polling in background
-            await self._app.initialize()
+            # Start polling — retry initialize() for transient TLS resets
+            try:
+                from telegram.error import NetworkError, TimedOut
+            except ImportError:
+                NetworkError = TimedOut = OSError  # type: ignore[misc,assignment]
+            _max_connect = 3
+            for _attempt in range(_max_connect):
+                try:
+                    await self._app.initialize()
+                    break
+                except (NetworkError, TimedOut, OSError) as init_err:
+                    if _attempt < _max_connect - 1:
+                        wait = 2 ** _attempt
+                        logger.warning(
+                            "[%s] Connect attempt %d/%d failed: %s — retrying in %ds",
+                            self.name, _attempt + 1, _max_connect, init_err, wait,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
             await self._app.start()
-            await self._app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            loop = asyncio.get_running_loop()
+
+            def _polling_error_callback(error: Exception) -> None:
+                if self._polling_error_task and not self._polling_error_task.done():
+                    return
+                if self._looks_like_polling_conflict(error):
+                    self._polling_error_task = loop.create_task(self._handle_polling_conflict(error))
+                elif self._looks_like_network_error(error):
+                    logger.warning("[%s] Telegram network error, scheduling reconnect: %s", self.name, error)
+                    self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
+                else:
+                    logger.error("[%s] Telegram polling error: %s", self.name, error, exc_info=True)
+
+            # Store reference for retry use in _handle_polling_conflict
+            self._polling_error_callback_ref = _polling_error_callback
+
+            await self._app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                error_callback=_polling_error_callback,
+            )
             
             # Register bot commands so Telegram shows a hint menu when users type /
+            # List is derived from the central COMMAND_REGISTRY — adding a new
+            # gateway command there automatically adds it to the Telegram menu.
             try:
                 from telegram import BotCommand
+                from hermes_cli.commands import telegram_bot_commands
                 await self._bot.set_my_commands([
-                    BotCommand("new", "Start a new conversation"),
-                    BotCommand("reset", "Reset conversation history"),
-                    BotCommand("model", "Show or change the model"),
-                    BotCommand("personality", "Set a personality"),
-                    BotCommand("retry", "Retry your last message"),
-                    BotCommand("undo", "Remove the last exchange"),
-                    BotCommand("status", "Show session info"),
-                    BotCommand("stop", "Stop the running agent"),
-                    BotCommand("sethome", "Set this chat as the home channel"),
-                    BotCommand("help", "Show available commands"),
+                    BotCommand(name, desc) for name, desc in telegram_bot_commands()
                 ])
             except Exception as e:
-                print(f"[{self.name}] Could not register command menu: {e}")
+                logger.warning(
+                    "[%s] Could not register Telegram command menu: %s",
+                    self.name,
+                    e,
+                    exc_info=True,
+                )
             
-            self._running = True
-            print(f"[{self.name}] Connected and polling for updates")
+            self._mark_connected()
+            logger.info("[%s] Connected and polling for Telegram updates", self.name)
             return True
             
         except Exception as e:
-            print(f"[{self.name}] Failed to connect: {e}")
+            if self._token_lock_identity:
+                try:
+                    from gateway.status import release_scoped_lock
+                    release_scoped_lock("telegram-bot-token", self._token_lock_identity)
+                except Exception:
+                    pass
+            message = f"Telegram startup failed: {e}"
+            self._set_fatal_error("telegram_connect_error", message, retryable=True)
+            logger.error("[%s] Failed to connect to Telegram: %s", self.name, e, exc_info=True)
             return False
     
     async def disconnect(self) -> None:
-        """Stop polling and disconnect."""
+        """Stop polling, cancel pending album flushes, and disconnect."""
+        pending_media_group_tasks = list(self._media_group_tasks.values())
+        for task in pending_media_group_tasks:
+            task.cancel()
+        if pending_media_group_tasks:
+            await asyncio.gather(*pending_media_group_tasks, return_exceptions=True)
+        self._media_group_tasks.clear()
+        self._media_group_events.clear()
+
         if self._app:
             try:
-                await self._app.updater.stop()
-                await self._app.stop()
+                # Only stop the updater if it's running
+                if self._app.updater and self._app.updater.running:
+                    await self._app.updater.stop()
+                if self._app.running:
+                    await self._app.stop()
                 await self._app.shutdown()
             except Exception as e:
-                print(f"[{self.name}] Error during disconnect: {e}")
-        
-        self._running = False
+                logger.warning("[%s] Error during Telegram disconnect: %s", self.name, e, exc_info=True)
+        if self._token_lock_identity:
+            try:
+                from gateway.status import release_scoped_lock
+                release_scoped_lock("telegram-bot-token", self._token_lock_identity)
+            except Exception as e:
+                logger.warning("[%s] Error releasing Telegram token lock: %s", self.name, e, exc_info=True)
+
+        for task in self._pending_photo_batch_tasks.values():
+            if task and not task.done():
+                task.cancel()
+        self._pending_photo_batch_tasks.clear()
+        self._pending_photo_batches.clear()
+
+        self._mark_disconnected()
         self._app = None
         self._bot = None
-        print(f"[{self.name}] Disconnected")
-    
+        self._token_lock_identity = None
+        logger.info("[%s] Disconnected from Telegram", self.name)
+
+    def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
+        """Determine if this message chunk should thread to the original message.
+
+        Args:
+            reply_to: The original message ID to reply to
+            chunk_index: Index of this chunk (0 = first chunk)
+
+        Returns:
+            True if this chunk should be threaded to the original message
+        """
+        if not reply_to:
+            return False
+        mode = self._reply_to_mode
+        if mode == "off":
+            return False
+        elif mode == "all":
+            return True
+        else:  # "first" (default)
+            return chunk_index == 0
+
     async def send(
         self,
         chat_id: str,
@@ -198,36 +478,62 @@ class TelegramAdapter(BasePlatformAdapter):
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            if len(chunks) > 1:
+                # truncate_message appends a raw " (1/2)" suffix. Escape the
+                # MarkdownV2-special parentheses so Telegram doesn't reject the
+                # chunk and fall back to plain text.
+                chunks = [
+                    re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
+                    for chunk in chunks
+                ]
             
             message_ids = []
             thread_id = metadata.get("thread_id") if metadata else None
             
+            try:
+                from telegram.error import NetworkError as _NetErr
+            except ImportError:
+                _NetErr = OSError  # type: ignore[misc,assignment]
+
             for i, chunk in enumerate(chunks):
-                # Try Markdown first, fall back to plain text if it fails
-                try:
-                    msg = await self._bot.send_message(
-                        chat_id=int(chat_id),
-                        text=chunk,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        reply_to_message_id=int(reply_to) if reply_to and i == 0 else None,
-                        message_thread_id=int(thread_id) if thread_id else None,
-                    )
-                except Exception as md_error:
-                    # Markdown parsing failed, try plain text
-                    if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                        logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                        # Strip MDV2 escape backslashes so the user doesn't
-                        # see raw backslashes littered through the message.
-                        plain_chunk = _strip_mdv2(chunk)
-                        msg = await self._bot.send_message(
-                            chat_id=int(chat_id),
-                            text=plain_chunk,
-                            parse_mode=None,  # Plain text
-                            reply_to_message_id=int(reply_to) if reply_to and i == 0 else None,
-                            message_thread_id=int(thread_id) if thread_id else None,
-                        )
-                    else:
-                        raise  # Re-raise if not a parse error
+                should_thread = self._should_thread_reply(reply_to, i)
+                reply_to_id = int(reply_to) if should_thread else None
+
+                msg = None
+                for _send_attempt in range(3):
+                    try:
+                        # Try Markdown first, fall back to plain text if it fails
+                        try:
+                            msg = await self._bot.send_message(
+                                chat_id=int(chat_id),
+                                text=chunk,
+                                parse_mode=ParseMode.MARKDOWN_V2,
+                                reply_to_message_id=reply_to_id,
+                                message_thread_id=int(thread_id) if thread_id else None,
+                            )
+                        except Exception as md_error:
+                            # Markdown parsing failed, try plain text
+                            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+                                plain_chunk = _strip_mdv2(chunk)
+                                msg = await self._bot.send_message(
+                                    chat_id=int(chat_id),
+                                    text=plain_chunk,
+                                    parse_mode=None,
+                                    reply_to_message_id=reply_to_id,
+                                    message_thread_id=int(thread_id) if thread_id else None,
+                                )
+                            else:
+                                raise
+                        break  # success
+                    except _NetErr as send_err:
+                        if _send_attempt < 2:
+                            wait = 2 ** _send_attempt
+                            logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
+                                           self.name, _send_attempt + 1, wait, send_err)
+                            await asyncio.sleep(wait)
+                        else:
+                            raise
                 message_ids.append(str(msg.message_id))
             
             return SendResult(
@@ -237,6 +543,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             
         except Exception as e:
+            logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
     async def edit_message(
@@ -257,7 +564,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
                 )
-            except Exception:
+            except Exception as fmt_err:
+                # "Message is not modified" is a no-op, not an error
+                if "not modified" in str(fmt_err).lower():
+                    return SendResult(success=True, message_id=message_id)
                 # Fallback: retry without markdown formatting
                 await self._bot.edit_message_text(
                     chat_id=int(chat_id),
@@ -266,6 +576,53 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
+            err_str = str(e).lower()
+            # "Message is not modified" — content identical, treat as success
+            if "not modified" in err_str:
+                return SendResult(success=True, message_id=message_id)
+            # Message too long — content exceeded 4096 chars (e.g. during
+            # streaming).  Truncate and succeed so the stream consumer can
+            # split the overflow into a new message instead of dying.
+            if "message_too_long" in err_str or "too long" in err_str:
+                truncated = content[: self.MAX_MESSAGE_LENGTH - 20] + "…"
+                try:
+                    await self._bot.edit_message_text(
+                        chat_id=int(chat_id),
+                        message_id=int(message_id),
+                        text=truncated,
+                    )
+                except Exception:
+                    pass  # best-effort truncation
+                return SendResult(success=True, message_id=message_id)
+            # Flood control / RetryAfter — back off and retry once
+            retry_after = getattr(e, "retry_after", None)
+            if retry_after is not None or "retry after" in err_str:
+                wait = retry_after if retry_after else 1.0
+                logger.warning(
+                    "[%s] Telegram flood control, waiting %.1fs",
+                    self.name, wait,
+                )
+                await asyncio.sleep(wait)
+                try:
+                    await self._bot.edit_message_text(
+                        chat_id=int(chat_id),
+                        message_id=int(message_id),
+                        text=content,
+                    )
+                    return SendResult(success=True, message_id=message_id)
+                except Exception as retry_err:
+                    logger.error(
+                        "[%s] Edit retry failed after flood wait: %s",
+                        self.name, retry_err,
+                    )
+                    return SendResult(success=False, error=str(retry_err))
+            logger.error(
+                "[%s] Failed to edit Telegram message %s: %s",
+                self.name,
+                message_id,
+                e,
+                exc_info=True,
+            )
             return SendResult(success=False, error=str(e))
 
     async def send_voice(
@@ -275,6 +632,7 @@ class TelegramAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> SendResult:
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
@@ -289,26 +647,33 @@ class TelegramAdapter(BasePlatformAdapter):
             with open(audio_path, "rb") as audio_file:
                 # .ogg files -> send as voice (round playable bubble)
                 if audio_path.endswith(".ogg") or audio_path.endswith(".opus"):
+                    _voice_thread = metadata.get("thread_id") if metadata else None
                     msg = await self._bot.send_voice(
                         chat_id=int(chat_id),
                         voice=audio_file,
                         caption=caption[:1024] if caption else None,
                         reply_to_message_id=int(reply_to) if reply_to else None,
-                        message_thread_id=int(thread_id) if thread_id else None,
+                        message_thread_id=int(_voice_thread) if _voice_thread else None,
                     )
                 else:
                     # .mp3 and others -> send as audio file
+                    _audio_thread = metadata.get("thread_id") if metadata else None
                     msg = await self._bot.send_audio(
                         chat_id=int(chat_id),
                         audio=audio_file,
                         caption=caption[:1024] if caption else None,
                         reply_to_message_id=int(reply_to) if reply_to else None,
-                        message_thread_id=int(thread_id) if thread_id else None,
+                        message_thread_id=int(_audio_thread) if _audio_thread else None,
                     )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            print(f"[{self.name}] Failed to send voice/audio: {e}")
-            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata)
+            logger.error(
+                "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
+            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
     
     async def send_image_file(
         self,
@@ -316,27 +681,102 @@ class TelegramAdapter(BasePlatformAdapter):
         image_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> SendResult:
         """Send a local image file natively as a Telegram photo."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
         try:
             import os
             if not os.path.exists(image_path):
                 return SendResult(success=False, error=f"Image file not found: {image_path}")
-            
+
+            _thread = metadata.get("thread_id") if metadata else None
             with open(image_path, "rb") as image_file:
                 msg = await self._bot.send_photo(
                     chat_id=int(chat_id),
                     photo=image_file,
                     caption=caption[:1024] if caption else None,
                     reply_to_message_id=int(reply_to) if reply_to else None,
+                    message_thread_id=int(_thread) if _thread else None,
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            print(f"[{self.name}] Failed to send local image: {e}")
+            logger.error(
+                "[%s] Failed to send Telegram local image, falling back to base adapter: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
             return await super().send_image_file(chat_id, image_path, caption, reply_to)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a document/file natively as a Telegram file attachment."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            if not os.path.exists(file_path):
+                return SendResult(success=False, error=f"File not found: {file_path}")
+
+            display_name = file_name or os.path.basename(file_path)
+            _thread = metadata.get("thread_id") if metadata else None
+
+            with open(file_path, "rb") as f:
+                msg = await self._bot.send_document(
+                    chat_id=int(chat_id),
+                    document=f,
+                    filename=display_name,
+                    caption=caption[:1024] if caption else None,
+                    reply_to_message_id=int(reply_to) if reply_to else None,
+                    message_thread_id=int(_thread) if _thread else None,
+                )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            print(f"[{self.name}] Failed to send document: {e}")
+            return await super().send_document(chat_id, file_path, caption, file_name, reply_to)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a video natively as a Telegram video message."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            if not os.path.exists(video_path):
+                return SendResult(success=False, error=f"Video file not found: {video_path}")
+
+            _thread = metadata.get("thread_id") if metadata else None
+            with open(video_path, "rb") as f:
+                msg = await self._bot.send_video(
+                    chat_id=int(chat_id),
+                    video=f,
+                    caption=caption[:1024] if caption else None,
+                    reply_to_message_id=int(reply_to) if reply_to else None,
+                    message_thread_id=int(_thread) if _thread else None,
+                )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            print(f"[{self.name}] Failed to send video: {e}")
+            return await super().send_video(chat_id, video_path, caption, reply_to)
 
     async def send_image(
         self,
@@ -357,16 +797,22 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id = metadata.get("thread_id") if metadata else None
         try:
             # Telegram can send photos directly from URLs (up to ~5MB)
+            _photo_thread = metadata.get("thread_id") if metadata else None
             msg = await self._bot.send_photo(
                 chat_id=int(chat_id),
                 photo=image_url,
                 caption=caption[:1024] if caption else None,  # Telegram caption limit
                 reply_to_message_id=int(reply_to) if reply_to else None,
-                message_thread_id=int(thread_id) if thread_id else None,
+                message_thread_id=int(_photo_thread) if _photo_thread else None,
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            logger.warning("[%s] URL-based send_photo failed (%s), trying file upload", self.name, e)
+            logger.warning(
+                "[%s] URL-based send_photo failed, trying file upload: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
             # Fallback: download and upload as file (supports up to 10MB)
             try:
                 import httpx
@@ -383,7 +829,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
-                logger.error("[%s] File upload send_photo also failed: %s", self.name, e2)
+                logger.error(
+                    "[%s] File upload send_photo also failed: %s",
+                    self.name,
+                    e2,
+                    exc_info=True,
+                )
                 # Final fallback: send URL as text
                 return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
     
@@ -401,16 +852,22 @@ class TelegramAdapter(BasePlatformAdapter):
 
         thread_id = metadata.get("thread_id") if metadata else None
         try:
+            _anim_thread = metadata.get("thread_id") if metadata else None
             msg = await self._bot.send_animation(
                 chat_id=int(chat_id),
                 animation=animation_url,
                 caption=caption[:1024] if caption else None,
                 reply_to_message_id=int(reply_to) if reply_to else None,
-                message_thread_id=int(thread_id) if thread_id else None,
+                message_thread_id=int(_anim_thread) if _anim_thread else None,
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            print(f"[{self.name}] Failed to send animation, falling back to photo: {e}")
+            logger.error(
+                "[%s] Failed to send Telegram animation, falling back to photo: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
             # Fallback: try as a regular photo
             return await self.send_image(chat_id, animation_url, caption, reply_to, metadata)
 
@@ -492,16 +949,24 @@ class TelegramAdapter(BasePlatformAdapter):
 
         return None
 
-    async def send_typing(self, chat_id: str) -> None:
+    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
         if self._bot:
             try:
+                _typing_thread = metadata.get("thread_id") if metadata else None
                 await self._bot.send_chat_action(
                     chat_id=int(chat_id),
-                    action="typing"
+                    action="typing",
+                    message_thread_id=int(_typing_thread) if _typing_thread else None,
                 )
-            except Exception:
-                pass  # Ignore typing indicator failures
+            except Exception as e:
+                # Typing failures are non-fatal; log at debug level only.
+                logger.debug(
+                    "[%s] Failed to send Telegram typing indicator: %s",
+                    self.name,
+                    e,
+                    exc_info=True,
+                )
     
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Telegram chat."""
@@ -528,6 +993,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 "is_forum": getattr(chat, "is_forum", False),
             }
         except Exception as e:
+            logger.error(
+                "[%s] Failed to get Telegram chat info for %s: %s",
+                self.name,
+                chat_id,
+                e,
+                exc_info=True,
+            )
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
     
     def format_message(self, content: str) -> str:
@@ -555,14 +1027,30 @@ class TelegramAdapter(BasePlatformAdapter):
         text = content
 
         # 1) Protect fenced code blocks (``` ... ```)
+        #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.
+        def _protect_fenced(m):
+            raw = m.group(0)
+            # Split off opening ``` (with optional language) and closing ```
+            open_end = raw.index('\n') + 1 if '\n' in raw[3:] else 3
+            opening = raw[:open_end]
+            body_and_close = raw[open_end:]
+            body = body_and_close[:-3]
+            body = body.replace('\\', '\\\\').replace('`', '\\`')
+            return _ph(opening + body + '```')
+
         text = re.sub(
             r'(```(?:[^\n]*\n)?[\s\S]*?```)',
-            lambda m: _ph(m.group(0)),
+            _protect_fenced,
             text,
         )
 
         # 2) Protect inline code (`...`)
-        text = re.sub(r'(`[^`]+`)', lambda m: _ph(m.group(0)), text)
+        #    Escape \ inside inline code per MarkdownV2 spec.
+        text = re.sub(
+            r'(`[^`]+`)',
+            lambda m: _ph(m.group(0).replace('\\', '\\\\')),
+            text,
+        )
 
         # 3) Convert markdown links – escape the display text; inside the URL
         #    only ')' and '\' need escaping per the MarkdownV2 spec.
@@ -600,23 +1088,89 @@ class TelegramAdapter(BasePlatformAdapter):
             text,
         )
 
-        # 7) Escape remaining special characters in plain text
+        # 7) Convert strikethrough: ~~text~~ → ~text~ (MarkdownV2)
+        text = re.sub(
+            r'~~(.+?)~~',
+            lambda m: _ph(f'~{_escape_mdv2(m.group(1))}~'),
+            text,
+        )
+
+        # 8) Convert spoiler: ||text|| → ||text|| (protect from | escaping)
+        text = re.sub(
+            r'\|\|(.+?)\|\|',
+            lambda m: _ph(f'||{_escape_mdv2(m.group(1))}||'),
+            text,
+        )
+
+        # 9) Convert blockquotes: > at line start → protect > from escaping
+        text = re.sub(
+            r'^(>{1,3}) (.+)$',
+            lambda m: _ph(m.group(1) + ' ' + _escape_mdv2(m.group(2))),
+            text,
+            flags=re.MULTILINE,
+        )
+
+        # 10) Escape remaining special characters in plain text
         text = _escape_mdv2(text)
 
-        # 8) Restore placeholders in reverse insertion order so that
+        # 11) Restore placeholders in reverse insertion order so that
         #    nested references (a placeholder inside another) resolve correctly.
         for key in reversed(list(placeholders.keys())):
             text = text.replace(key, placeholders[key])
 
+        # 12) Safety net: escape unescaped ( ) { } that slipped through
+        #     placeholder processing.  Split the text into code/non-code
+        #     segments so we never touch content inside ``` or ` spans.
+        _code_split = re.split(r'(```[\s\S]*?```|`[^`]+`)', text)
+        _safe_parts = []
+        for _idx, _seg in enumerate(_code_split):
+            if _idx % 2 == 1:
+                # Inside code span/block — leave untouched
+                _safe_parts.append(_seg)
+            else:
+                # Outside code — escape bare ( ) { }
+                def _esc_bare(m, _seg=_seg):
+                    s = m.start()
+                    ch = m.group(0)
+                    # Already escaped
+                    if s > 0 and _seg[s - 1] == '\\':
+                        return ch
+                    # ( that opens a MarkdownV2 link [text](url)
+                    if ch == '(' and s > 0 and _seg[s - 1] == ']':
+                        return ch
+                    # ) that closes a link URL
+                    if ch == ')':
+                        before = _seg[:s]
+                        if '](http' in before or '](' in before:
+                            # Check depth
+                            depth = 0
+                            for j in range(s - 1, max(s - 2000, -1), -1):
+                                if _seg[j] == '(':
+                                    depth -= 1
+                                    if depth < 0:
+                                        if j > 0 and _seg[j - 1] == ']':
+                                            return ch
+                                        break
+                                elif _seg[j] == ')':
+                                    depth += 1
+                    return '\\' + ch
+                _safe_parts.append(re.sub(r'[(){}]', _esc_bare, _seg))
+        text = ''.join(_safe_parts)
+
         return text
     
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming text messages."""
+        """Handle incoming text messages.
+
+        Telegram clients split long messages into multiple updates.  Buffer
+        rapid successive text messages from the same user/chat and aggregate
+        them into a single MessageEvent before dispatching.
+        """
         if not update.message or not update.message.text:
             return
-        
+
         event = self._build_message_event(update.message, MessageType.TEXT)
-        await self.handle_message(event)
+        self._enqueue_text_event(event)
     
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -626,6 +1180,149 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(update.message, MessageType.COMMAND)
         await self.handle_message(event)
     
+    async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle incoming location/venue pin messages."""
+        if not update.message:
+            return
+
+        msg = update.message
+        venue = getattr(msg, "venue", None)
+        location = getattr(venue, "location", None) if venue else getattr(msg, "location", None)
+
+        if not location:
+            return
+
+        lat = getattr(location, "latitude", None)
+        lon = getattr(location, "longitude", None)
+        if lat is None or lon is None:
+            return
+
+        # Build a text message with coordinates and context
+        parts = ["[The user shared a location pin.]"]
+        if venue:
+            title = getattr(venue, "title", None)
+            address = getattr(venue, "address", None)
+            if title:
+                parts.append(f"Venue: {title}")
+            if address:
+                parts.append(f"Address: {address}")
+        parts.append(f"latitude: {lat}")
+        parts.append(f"longitude: {lon}")
+        parts.append(f"Map: https://www.google.com/maps/search/?api=1&query={lat},{lon}")
+        parts.append("Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences.")
+
+        event = self._build_message_event(msg, MessageType.LOCATION)
+        event.text = "\n".join(parts)
+        await self.handle_message(event)
+
+    # ------------------------------------------------------------------
+    # Text message aggregation (handles Telegram client-side splits)
+    # ------------------------------------------------------------------
+
+    def _text_batch_key(self, event: MessageEvent) -> str:
+        """Session-scoped key for text message batching."""
+        from gateway.session import build_session_key
+        return build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+        )
+
+    def _enqueue_text_event(self, event: MessageEvent) -> None:
+        """Buffer a text event and reset the flush timer.
+
+        When Telegram splits a long user message into multiple updates,
+        they arrive within a few hundred milliseconds.  This method
+        concatenates them and waits for a short quiet period before
+        dispatching the combined message.
+        """
+        key = self._text_batch_key(event)
+        existing = self._pending_text_batches.get(key)
+        if existing is None:
+            self._pending_text_batches[key] = event
+        else:
+            # Append text from the follow-up chunk
+            if event.text:
+                existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            # Merge any media that might be attached
+            if event.media_urls:
+                existing.media_urls.extend(event.media_urls)
+                existing.media_types.extend(event.media_types)
+
+        # Cancel any pending flush and restart the timer
+        prior_task = self._pending_text_batch_tasks.get(key)
+        if prior_task and not prior_task.done():
+            prior_task.cancel()
+        self._pending_text_batch_tasks[key] = asyncio.create_task(
+            self._flush_text_batch(key)
+        )
+
+    async def _flush_text_batch(self, key: str) -> None:
+        """Wait for the quiet period then dispatch the aggregated text."""
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(self._text_batch_delay_seconds)
+            event = self._pending_text_batches.pop(key, None)
+            if not event:
+                return
+            logger.info(
+                "[Telegram] Flushing text batch %s (%d chars)",
+                key, len(event.text or ""),
+            )
+            await self.handle_message(event)
+        finally:
+            if self._pending_text_batch_tasks.get(key) is current_task:
+                self._pending_text_batch_tasks.pop(key, None)
+
+    # ------------------------------------------------------------------
+    # Photo batching
+    # ------------------------------------------------------------------
+
+    def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
+        """Return a batching key for Telegram photos/albums."""
+        from gateway.session import build_session_key
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+        )
+        media_group_id = getattr(msg, "media_group_id", None)
+        if media_group_id:
+            return f"{session_key}:album:{media_group_id}"
+        return f"{session_key}:photo-burst"
+
+    async def _flush_photo_batch(self, batch_key: str) -> None:
+        """Send a buffered photo burst/album as a single MessageEvent."""
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(self._media_batch_delay_seconds)
+            event = self._pending_photo_batches.pop(batch_key, None)
+            if not event:
+                return
+            logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
+            await self.handle_message(event)
+        finally:
+            if self._pending_photo_batch_tasks.get(batch_key) is current_task:
+                self._pending_photo_batch_tasks.pop(batch_key, None)
+
+    def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
+        """Merge photo events into a pending batch and schedule flush."""
+        existing = self._pending_photo_batches.get(batch_key)
+        if existing is None:
+            self._pending_photo_batches[batch_key] = event
+        else:
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            if event.text:
+                if not existing.text:
+                    existing.text = event.text
+                elif event.text not in existing.text:
+                    existing.text = f"{existing.text}\n\n{event.text}".strip()
+
+        prior_task = self._pending_photo_batch_tasks.get(batch_key)
+        if prior_task and not prior_task.done():
+            prior_task.cancel()
+
+        self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
+
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
@@ -677,14 +1374,22 @@ class TelegramAdapter(BasePlatformAdapter):
                         if file_obj.file_path.lower().endswith(candidate):
                             ext = candidate
                             break
-                # Save to cache and populate media_urls with the local path
+                # Save to local cache (for vision tool access)
                 cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
                 event.media_urls = [cached_path]
-                event.media_types = [f"image/{ext.lstrip('.')}"]
-                print(f"[Telegram] Cached user photo: {cached_path}", flush=True)
+                event.media_types = [f"image/{ext.lstrip('.')}" ]
+                logger.info("[Telegram] Cached user photo at %s", cached_path)
+                media_group_id = getattr(msg, "media_group_id", None)
+                if media_group_id:
+                    await self._queue_media_group_event(str(media_group_id), event)
+                else:
+                    batch_key = self._photo_batch_key(event, msg)
+                    self._enqueue_photo_event(batch_key, event)
+                return
+
             except Exception as e:
-                print(f"[Telegram] Failed to cache photo: {e}", flush=True)
-        
+                logger.warning("[Telegram] Failed to cache photo: %s", e, exc_info=True)
+
         # Download voice/audio messages to cache for STT transcription
         if msg.voice:
             try:
@@ -693,9 +1398,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/ogg"]
-                print(f"[Telegram] Cached user voice: {cached_path}", flush=True)
+                logger.info("[Telegram] Cached user voice at %s", cached_path)
             except Exception as e:
-                print(f"[Telegram] Failed to cache voice: {e}", flush=True)
+                logger.warning("[Telegram] Failed to cache voice: %s", e, exc_info=True)
         elif msg.audio:
             try:
                 file_obj = await msg.audio.get_file()
@@ -703,9 +1408,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/mp3"]
-                print(f"[Telegram] Cached user audio: {cached_path}", flush=True)
+                logger.info("[Telegram] Cached user audio at %s", cached_path)
             except Exception as e:
-                print(f"[Telegram] Failed to cache audio: {e}", flush=True)
+                logger.warning("[Telegram] Failed to cache audio: %s", e, exc_info=True)
 
         # Download document files to cache for agent processing
         elif msg.document:
@@ -730,7 +1435,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Unsupported document type '{ext or 'unknown'}'. "
                         f"Supported types: {supported_list}"
                     )
-                    print(f"[Telegram] Unsupported document type: {ext or 'unknown'}", flush=True)
+                    logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
                     await self.handle_message(event)
                     return
 
@@ -741,7 +1446,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "The document is too large or its size could not be verified. "
                         "Maximum: 20 MB."
                     )
-                    print(f"[Telegram] Document too large: {doc.file_size} bytes", flush=True)
+                    logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
                     await self.handle_message(event)
                     return
 
@@ -753,7 +1458,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 mime_type = SUPPORTED_DOCUMENT_TYPES[ext]
                 event.media_urls = [cached_path]
                 event.media_types = [mime_type]
-                print(f"[Telegram] Cached user document: {cached_path}", flush=True)
+                logger.info("[Telegram] Cached user document at %s", cached_path)
 
                 # For text files, inject content into event.text (capped at 100 KB)
                 MAX_TEXT_INJECT_BYTES = 100 * 1024
@@ -768,13 +1473,61 @@ class TelegramAdapter(BasePlatformAdapter):
                         else:
                             event.text = injection
                     except UnicodeDecodeError:
-                        print(f"[Telegram] Could not decode text file as UTF-8, skipping content injection", flush=True)
+                        logger.warning(
+                            "[Telegram] Could not decode text file as UTF-8, skipping content injection",
+                            exc_info=True,
+                        )
 
             except Exception as e:
-                print(f"[Telegram] Failed to cache document: {e}", flush=True)
+                logger.warning("[Telegram] Failed to cache document: %s", e, exc_info=True)
+
+        media_group_id = getattr(msg, "media_group_id", None)
+        if media_group_id:
+            await self._queue_media_group_event(str(media_group_id), event)
+            return
 
         await self.handle_message(event)
     
+    async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
+        """Buffer Telegram media-group items so albums arrive as one logical event.
+
+        Telegram delivers albums as multiple updates with a shared media_group_id.
+        If we forward each item immediately, the gateway thinks the second image is a
+        new user message and interrupts the first. We debounce briefly and merge the
+        attachments into a single MessageEvent.
+        """
+        existing = self._media_group_events.get(media_group_id)
+        if existing is None:
+            self._media_group_events[media_group_id] = event
+        else:
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            if event.text:
+                if existing.text:
+                    if event.text not in existing.text.split("\n\n"):
+                        existing.text = f"{existing.text}\n\n{event.text}"
+                else:
+                    existing.text = event.text
+
+        prior_task = self._media_group_tasks.get(media_group_id)
+        if prior_task:
+            prior_task.cancel()
+
+        self._media_group_tasks[media_group_id] = asyncio.create_task(
+            self._flush_media_group_event(media_group_id)
+        )
+
+    async def _flush_media_group_event(self, media_group_id: str) -> None:
+        try:
+            await asyncio.sleep(self.MEDIA_GROUP_WAIT_SECONDS)
+            event = self._media_group_events.pop(media_group_id, None)
+            if event is not None:
+                await self.handle_message(event)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._media_group_tasks.pop(media_group_id, None)
+
     async def _handle_sticker(self, msg: Message, event: "MessageEvent") -> None:
         """
         Describe a Telegram sticker via vision analysis, with caching.
@@ -806,7 +1559,7 @@ class TelegramAdapter(BasePlatformAdapter):
             event.text = build_sticker_injection(
                 cached["description"], cached.get("emoji", emoji), cached.get("set_name", set_name)
             )
-            print(f"[Telegram] Sticker cache hit: {sticker.file_unique_id}", flush=True)
+            logger.info("[Telegram] Sticker cache hit: %s", sticker.file_unique_id)
             return
 
         # Cache miss -- download and analyze
@@ -814,7 +1567,7 @@ class TelegramAdapter(BasePlatformAdapter):
             file_obj = await sticker.get_file()
             image_bytes = await file_obj.download_as_bytearray()
             cached_path = cache_image_from_bytes(bytes(image_bytes), ext=".webp")
-            print(f"[Telegram] Analyzing sticker: {cached_path}", flush=True)
+            logger.info("[Telegram] Analyzing sticker at %s", cached_path)
 
             from tools.vision_tools import vision_analyze_tool
             import json as _json
@@ -836,7 +1589,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     emoji, set_name,
                 )
         except Exception as e:
-            print(f"[Telegram] Sticker analysis error: {e}", flush=True)
+            logger.warning("[Telegram] Sticker analysis error: %s", e, exc_info=True)
             event.text = build_sticker_injection(
                 f"a sticker with emoji {emoji}" if emoji else "a sticker",
                 emoji, set_name,
@@ -864,11 +1617,20 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id=str(message.message_thread_id) if message.message_thread_id else None,
         )
         
+        # Extract reply context if this message is a reply
+        reply_to_id = None
+        reply_to_text = None
+        if message.reply_to_message:
+            reply_to_id = str(message.reply_to_message.message_id)
+            reply_to_text = message.reply_to_message.text or message.reply_to_message.caption or None
+
         return MessageEvent(
             text=message.text or "",
             message_type=msg_type,
             source=source,
             raw_message=message,
             message_id=str(message.message_id),
+            reply_to_message_id=reply_to_id,
+            reply_to_text=reply_to_text,
             timestamp=message.date,
         )
